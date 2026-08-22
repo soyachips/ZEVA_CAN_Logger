@@ -1,0 +1,360 @@
+#include <Arduino.h>
+#include <SPI.h>
+#include <SD.h>
+#include <driver/twai.h>
+#include <time.h>
+
+static const gpio_num_t CAN_TX_PIN = GPIO_NUM_21;
+static const gpio_num_t CAN_RX_PIN = GPIO_NUM_22;
+static const uint32_t CAN_SPEED = 250000;
+static const uint32_t BMS_BASE_ID = 300;
+static const uint8_t MAX_BMS_MODULES = 16;
+
+// ZEVA CAN IDs (from ZEVA EVMS Common.h)
+static const uint32_t CAN_BASE_ID = 30;
+static const uint32_t CORE_BROADCAST_STATUS = CAN_BASE_ID;
+static const uint32_t CORE_SEND_CELL_NUMS = 56; // ZEVA core -> monitor explicit module cell counts
+#define CAN_CURRENT_SENSOR_ID 40
+
+struct BmsModuleState {
+  bool seen[4];
+  uint16_t volts[12];
+};
+
+static BmsModuleState bmsModules[MAX_BMS_MODULES];
+static bool moduleReady[MAX_BMS_MODULES] = { false };
+static uint8_t bmsCellCounts[MAX_BMS_MODULES] = { 0 };
+static bool haveBmsCellCounts = false;
+
+// EVMS-level values
+static int packVoltage = 0;     // raw ZEVA value in tenths of a volt
+static long packCurrent = 0;    // raw current in milliamps after offset correction
+
+static void appendPackVoltage(char *buffer, size_t size, int &len, int rawVoltage) {
+  int whole = rawVoltage / 10;
+  int frac = abs(rawVoltage % 10);
+  len += snprintf(buffer + len, size - len, ",packV=%d.%d", whole, frac);
+}
+
+static void appendPackCurrent(char *buffer, size_t size, int &len, long rawCurrent) {
+  bool negative = rawCurrent < 0;
+  long absCurrent = negative ? -rawCurrent : rawCurrent;
+  long currentTenths = (absCurrent + 50) / 100; // round to 0.1 A
+  long whole = currentTenths / 10;
+  int frac = currentTenths % 10;
+  len += snprintf(buffer + len, size - len, ",packI=%s%ld.%d", negative ? "-" : "", whole, frac);
+}
+
+static void appendCellVoltage(char *buffer, size_t size, int &len, int cellIndex, uint16_t rawVoltage) {
+  int whole = rawVoltage / 1000;
+  int frac = rawVoltage % 1000;
+  len += snprintf(buffer + len, size - len, ",cell%d=%d.%03d", cellIndex, whole, frac);
+}
+
+static const int SD_CS_PIN = 27;
+static const int SD_MISO_PIN = 19;
+static const int SD_MOSI_PIN = 23;
+static const int SD_SCK_PIN = 18;
+static const int MAX_LOG_FILE_DAYS = 7;
+static SPIClass sdSpi(VSPI);
+static File logFile;
+static char currentLogFileName[32] = "";
+static bool sdInitialized = false;
+
+static void getCurrentLogDate(char *dateString, size_t size) {
+  time_t now = time(nullptr);
+  if (now < 24 * 3600) {
+    strncpy(dateString, "unknown", size);
+    dateString[size - 1] = '\0';
+    return;
+  }
+  struct tm timeinfo;
+  localtime_r(&now, &timeinfo);
+  strftime(dateString, size, "%Y%m%d", &timeinfo);
+}
+
+static void getLogFileName(char *filename, size_t size) {
+  char dateString[16];
+  getCurrentLogDate(dateString, sizeof(dateString));
+  if (strcmp(dateString, "unknown") == 0) {
+    snprintf(filename, size, "log-session.csv");
+  } else {
+    snprintf(filename, size, "log-%s.csv", dateString);
+  }
+}
+
+static void purgeOldLogFiles() {
+  if (!sdInitialized) return;
+
+  File root = SD.open("/");
+  if (!root) return;
+
+  const int maxFiles = MAX_LOG_FILE_DAYS + 8;
+  char logFiles[maxFiles][32];
+  int fileCount = 0;
+
+  while (true) {
+    File entry = root.openNextFile();
+    if (!entry) break;
+    if (!entry.isDirectory()) {
+      const char *name = entry.name();
+      int len = strlen(name);
+      if (len == 16 && strncmp(name, "log-", 4) == 0 && strcmp(name + 12, ".csv") == 0) {
+        if (fileCount < maxFiles) {
+          strcpy(logFiles[fileCount++], name);
+        }
+      }
+    }
+    entry.close();
+  }
+  root.close();
+
+  if (fileCount <= MAX_LOG_FILE_DAYS) return;
+
+  for (int i = 0; i < fileCount - 1; ++i) {
+    for (int j = i + 1; j < fileCount; ++j) {
+      if (strcmp(logFiles[i], logFiles[j]) > 0) {
+        char temp[32];
+        strcpy(temp, logFiles[i]);
+        strcpy(logFiles[i], logFiles[j]);
+        strcpy(logFiles[j], temp);
+      }
+    }
+  }
+
+  for (int i = 0; i < fileCount - MAX_LOG_FILE_DAYS; ++i) {
+    SD.remove(logFiles[i]);
+  }
+}
+
+static bool openLogFile() {
+  if (!sdInitialized) return false;
+
+  char filename[32];
+  getLogFileName(filename, sizeof(filename));
+  if (strcmp(filename, currentLogFileName) == 0 && logFile) {
+    return true;
+  }
+
+  if (logFile) {
+    logFile.close();
+    currentLogFileName[0] = '\0';
+  }
+
+  logFile = SD.open(filename, FILE_APPEND);
+  if (!logFile) {
+    return false;
+  }
+
+  strncpy(currentLogFileName, filename, sizeof(currentLogFileName));
+  currentLogFileName[sizeof(currentLogFileName) - 1] = '\0';
+  return true;
+}
+
+static uint8_t countUsedModuleCells(const BmsModuleState &state) {
+  const uint16_t threshold = 1000; // assume unused cells are near 0
+  uint8_t count = 0;
+  for (int i = 0; i < 12; ++i) {
+    if (state.volts[i] >= threshold)
+      ++count;
+    else
+      break;
+  }
+  return count;
+}
+
+static uint8_t getModuleCellCount(uint8_t moduleId) {
+  if (haveBmsCellCounts)
+    return bmsCellCounts[moduleId];
+  return countUsedModuleCells(bmsModules[moduleId]);
+}
+
+static bool readyPackIsContiguous() {
+  int maxModule = -1;
+  for (int i = 0; i < MAX_BMS_MODULES; ++i) {
+    if (moduleReady[i]) maxModule = i;
+  }
+  if (maxModule < 0) return false;
+  for (int i = 0; i <= maxModule; ++i) {
+    if (!moduleReady[i]) return false;
+  }
+  return true;
+}
+
+static void clearReadyModules() {
+  for (int i = 0; i < MAX_BMS_MODULES; ++i) moduleReady[i] = false;
+}
+
+void printPackVoltages(uint32_t timestamp) {
+  char buffer[512];
+  int len = snprintf(buffer, sizeof(buffer), "%lu", timestamp);
+  appendPackVoltage(buffer, sizeof(buffer), len, packVoltage);
+  appendPackCurrent(buffer, sizeof(buffer), len, packCurrent);
+
+  int cellIndex = 1;
+  for (int m = 0; m < MAX_BMS_MODULES; ++m) {
+    uint8_t used = getModuleCellCount(m);
+    for (int c = 0; c < used; ++c) {
+      appendCellVoltage(buffer, sizeof(buffer), len, cellIndex, bmsModules[m].volts[c]);
+      ++cellIndex;
+    }
+  }
+  len += snprintf(buffer + len, sizeof(buffer) - len, ",cells=%d", cellIndex - 1);
+
+  Serial.println(buffer);
+  if (sdInitialized) {
+    if (openLogFile()) {
+      logFile.println(buffer);
+      logFile.flush();
+    } else {
+      Serial.println("Failed to rotate/open log file.");
+    }
+  }
+}
+
+bool setupCAN() {
+  const twai_timing_config_t timing_config = TWAI_TIMING_CONFIG_250KBITS();
+  const twai_filter_config_t filter_config = TWAI_FILTER_CONFIG_ACCEPT_ALL();
+  const twai_general_config_t general_config = TWAI_GENERAL_CONFIG_DEFAULT(CAN_TX_PIN, CAN_RX_PIN, TWAI_MODE_NORMAL);
+
+  esp_err_t err = twai_driver_install(&general_config, &timing_config, &filter_config);
+  if (err != ESP_OK) {
+    Serial.printf("TWAI driver install failed: %d\n", err);
+    return false;
+  }
+
+  err = twai_start();
+  if (err != ESP_OK) {
+    Serial.printf("TWAI start failed: %d\n", err);
+    return false;
+  }
+
+  Serial.printf("CAN initialized at %u kbps\n", CAN_SPEED / 1000);
+  return true;
+}
+
+void setup() {
+  Serial.begin(115200);
+  delay(1000);
+
+  Serial.println("ZEVA ESP32 CAN cell voltage logger");
+  Serial.println("Waiting for CAN data...");
+
+  if (!setupCAN()) {
+    Serial.println("CAN initialization failed. Check CAN wiring and transceiver.");
+  }
+
+  sdSpi.begin(SD_SCK_PIN, SD_MISO_PIN, SD_MOSI_PIN, SD_CS_PIN);
+  if (!SD.begin(SD_CS_PIN, sdSpi)) {
+    Serial.println("SD initialization failed. Check SD card wiring and card presence.");
+  } else {
+    sdInitialized = true;
+    Serial.println("SD initialized.");
+    purgeOldLogFiles();
+    if (openLogFile()) {
+      Serial.printf("Logging enabled: %s\n", currentLogFileName);
+      logFile.println("SD_TEST,OK");
+      logFile.flush();
+      Serial.println("SD test line written.");
+    } else {
+      Serial.println("Failed to open log file for writing.");
+    }
+  }
+
+  memset(bmsModules, 0, sizeof(bmsModules));
+}
+
+void processBmsMessage(uint32_t packetId, const uint8_t data[8], size_t length) {
+  if (packetId >= BMS_BASE_ID) {
+    uint32_t index = packetId - BMS_BASE_ID;
+    uint8_t moduleId = index / 10;
+    uint8_t packetType = index % 10;
+
+    if (moduleId >= MAX_BMS_MODULES) {
+      return;
+    }
+
+    BmsModuleState &state = bmsModules[moduleId];
+
+    switch (packetType) {
+    case 1:
+      for (int i = 0; i < 4 && i * 2 + 1 < length; ++i) {
+        state.volts[i] = (uint16_t(data[i * 2]) << 8) | data[i * 2 + 1];
+      }
+      state.seen[0] = true;
+      break;
+    case 2:
+      for (int i = 0; i < 4 && i * 2 + 1 < length; ++i) {
+        state.volts[4 + i] = (uint16_t(data[i * 2]) << 8) | data[i * 2 + 1];
+      }
+      state.seen[1] = true;
+      break;
+    case 3:
+      for (int i = 0; i < 4 && i * 2 + 1 < length; ++i) {
+        state.volts[8 + i] = (uint16_t(data[i * 2]) << 8) | data[i * 2 + 1];
+      }
+      state.seen[2] = true;
+      break;
+    case 4:
+      state.seen[3] = true;
+      break;
+    default:
+      return;
+  }
+
+  if (state.seen[0] && state.seen[1] && state.seen[2] && state.seen[3]) {
+    moduleReady[moduleId] = true;
+    if (readyPackIsContiguous()) {
+      printPackVoltages(millis());
+      clearReadyModules();
+    }
+  }
+  return;
+  }
+
+  // Handle EVMS/core messages (IDs below BMS_BASE_ID)
+  switch (packetId) {
+    case CORE_BROADCAST_STATUS:
+      // Pack voltage is stored in bytes 3..4 (big-endian) per ZEVA EVMS
+      if (length >= 5) {
+        packVoltage = (int(data[3]) << 8) | data[4];
+      }
+      break;
+    case CORE_SEND_CELL_NUMS:
+      if (length >= 8) {
+        for (int i = 0; i < 8; ++i) {
+          uint8_t byte = data[i];
+          bmsCellCounts[i*2] = byte & 0x0F;
+          bmsCellCounts[i*2 + 1] = byte >> 4;
+        }
+        haveBmsCellCounts = true;
+      }
+      break;
+    case CAN_CURRENT_SENSOR_ID:
+      // 24-bit value with offset; replicate ZEVA behavior: value - 8388608
+      if (length >= 3) {
+        unsigned long raw = ((unsigned long)data[0] << 16) | ((unsigned long)data[1] << 8) | (unsigned long)data[2];
+        packCurrent = (long)raw - 8388608L;
+      }
+      break;
+    default:
+      // Other messages not handled here
+      break;
+  }
+}
+
+void loop() {
+  static uint32_t lastPrint = 0;
+  twai_message_t message;
+
+  if (twai_receive(&message, pdMS_TO_TICKS(100)) == ESP_OK) {
+    if (message.extd) {
+      processBmsMessage(message.identifier, message.data, message.data_length_code);
+    }
+  }
+
+  if (millis() - lastPrint >= 1000) {
+    lastPrint = millis();
+    Serial.println("Waiting for CAN data...");
+  }
+}
