@@ -8,12 +8,15 @@
 #include <WebServer.h>
 #include <ElegantOTA.h>
 
-// --- NETWORK CREDENTIAL MANAGEMENT ---
-const char* ssid = "TestNet";
-const char* password = "4985werd";
+#include "secrets.h"
 
-const char* home_ssid = "ABcb";
-const char* home_password = "stomp-doghouse-splinter"; 
+// --- NETWORK CREDENTIAL MANAGEMENT ---
+// Real values live in include/secrets.h (gitignored) — see include/secrets.h.example
+const char* ssid = SECRET_HOTSPOT_SSID;
+const char* password = SECRET_HOTSPOT_PASSWORD;
+
+const char* home_ssid = SECRET_HOME_SSID;
+const char* home_password = SECRET_HOME_PASSWORD;
 
 // --- TIMEZONE CONFIGURATION ---
 const char* ntpServer = "pool.ntp.org";
@@ -24,7 +27,6 @@ const int   daylightOffset_sec = 3600;     // 1 hour daylight savings shift
 static uint32_t zeroCurrentStartTime = 0;
 static bool trackingZeroCurrent = false;
 static bool hasScannedThisIdleSession = false;
-static bool isSynchronizing = false;
 
 const char index_html[] PROGMEM = R"rawliteral(
 <!DOCTYPE html>
@@ -68,7 +70,7 @@ const char index_html[] PROGMEM = R"rawliteral(
         </div>
     </div>
 
-    <!-- CHART 2: Sensitive 26-Cell Voltage Matrix Layer -->
+    <!-- CHART 2: Per-Cell Voltage Matrix Layer -->
     <div class="chart-box">
         <div class="chart-title" id="dynamic-title">Cell Voltages</div>
         <div style="position: relative; height: 380px; width: 100%;">
@@ -264,6 +266,15 @@ static bool haveBmsCellCounts = false;
 static int packVoltage = 0;     // raw ZEVA value in tenths of a volt
 static long packCurrent = 0;    // raw current in milliamps after offset correction
 
+// Sensor noise/offset means packCurrent will rarely read exactly 0 at rest;
+// treat anything within this deadband as idle. Tune to your current sensor's
+// actual noise floor once real hardware is connected.
+static const long CURRENT_IDLE_THRESHOLD_MA = 500;
+
+static bool isPackIdle() {
+	return labs(packCurrent) < CURRENT_IDLE_THRESHOLD_MA;
+}
+
 static void appendPackVoltageValue(char *buffer, size_t size, int &len, int rawVoltage) {
 	int whole = rawVoltage / 10;
 	int frac = abs(rawVoltage % 10);
@@ -295,6 +306,8 @@ static File logFile;
 static char currentLogFileName[32] = "";
 static bool sdInitialized = false;
 
+static void writeLogHeader(File &file);
+
 static void getCurrentLogDate(char *dateString, size_t size) {
 	time_t now = time(nullptr);
 	if (now < 24 * 3600) {
@@ -307,14 +320,30 @@ static void getCurrentLogDate(char *dateString, size_t size) {
 	strftime(dateString, size, "%Y%m%d", &timeinfo);
 }
 
+// Resolves to the same filename for the whole boot session: once a date is
+// known (or known to be unavailable) that doesn't change until reboot, and
+// callers rely on getting back the exact same name every time they ask.
 static void getLogFileName(char *filename, size_t size) {
-	char dateString[16];
-	getCurrentLogDate(dateString, sizeof(dateString));
-	if (strcmp(dateString, "unknown") == 0) {
-		snprintf(filename, size, "/log-session.csv");
-	} else {
-		snprintf(filename, size, "/log-%s.csv", dateString);
+	static char resolvedName[32] = "";
+
+	if (resolvedName[0] == '\0') {
+		char dateString[16];
+		getCurrentLogDate(dateString, sizeof(dateString));
+		if (strcmp(dateString, "unknown") == 0) {
+			// No date available: pick a session-numbered name so multiple
+			// undated boots on the same card don't merge into one file.
+			int sessionCounter = 1;
+			do {
+				snprintf(resolvedName, sizeof(resolvedName), "/log-session-%02d.csv", sessionCounter++);
+			} while (SD.exists(resolvedName));
+		} else {
+			// One file per calendar day; purgeOldLogFiles() rotates these out.
+			snprintf(resolvedName, sizeof(resolvedName), "/log-%s.csv", dateString);
+		}
 	}
+
+	strncpy(filename, resolvedName, size);
+	filename[size - 1] = '\0';
 }
 
 static void purgeOldLogFiles() {
@@ -381,9 +410,15 @@ static bool openLogFile() {
 		currentLogFileName[0] = '\0';
 	}
 
+	bool isNewFile = !SD.exists(filename);
+
 	logFile = SD.open(filename, FILE_APPEND);
 	if (!logFile) {
 		return false;
+	}
+
+	if (isNewFile) {
+		writeLogHeader(logFile);
 	}
 
 	strncpy(currentLogFileName, filename, sizeof(currentLogFileName));
@@ -452,8 +487,8 @@ void printPackVoltages(uint32_t timestamp) {
 	// Always output to the Serial Terminal for instant debugging
 	Serial.println(buffer);
 
-	// ONLY write to the SD card if current is non-zero (charging or discharging)
-	if (sdInitialized && packCurrent != 0) {
+	// ONLY write to the SD card if current is outside the idle deadband (charging or discharging)
+	if (sdInitialized && !isPackIdle()) {
 		if (openLogFile()) {
 			logFile.println(buffer);
 			logFile.flush(); // Safely saves data to the flash sector
@@ -484,15 +519,52 @@ bool setupCAN() {
 	return true;
 }
 
+static bool syncTimeFromNTP() {
+	Serial.println("Syncing calendar time from internet NTP...");
+	configTime(gmtOffset_sec, daylightOffset_sec, ntpServer);
+
+	struct tm timeinfo;
+	if (getLocalTime(&timeinfo, 4000)) {
+		Serial.println("System time synchronized successfully!");
+		return true;
+	}
+	Serial.println("NTP Sync timed out.");
+	return false;
+}
+
 void setup() {
 	Serial.begin(115200);
 	delay(1000);
 
-	// 1. Set wireless station properties
 	WiFi.mode(WIFI_STA);
+	bool timeSynced = false;
+
+	// 0. If we're already in range of home Wi-Fi (e.g. starting the ride from
+	// home), connect briefly just to sync the clock before the log file for
+	// this session gets named further down.
+	Serial.print("Checking for Home Wi-Fi (10s timeout)");
+	WiFi.begin(home_ssid, home_password);
+
+	int homeAttemptCounter = 0;
+	while (WiFi.status() != WL_CONNECTED && homeAttemptCounter < 20) {
+		delay(500);
+		Serial.print(".");
+		homeAttemptCounter++;
+	}
+
+	if (WiFi.status() == WL_CONNECTED) {
+		Serial.println("\nHome Wi-Fi found.");
+		timeSynced = syncTimeFromNTP();
+		WiFi.disconnect();
+		delay(200);
+	} else {
+		Serial.println("\nHome Wi-Fi not found at boot.");
+	}
+
+	// 1. Set wireless station properties
 	WiFi.begin(ssid, password);
 	Serial.print("Searching for Hotspot (10s timeout)");
-	
+
 	int attemptCounter = 0;
 	bool wifiConnected = true;
 
@@ -504,10 +576,10 @@ void setup() {
 
 		if (attemptCounter >= 20) {
 			wifiConnected = false;
-			break; 
+			break;
 		}
 	}
-	
+
 	// BRANCH A: ONLINE MODE (Hotspot Found!)
 	if (wifiConnected) {
 		Serial.println("\nConnected successfully!!! Network node established.");
@@ -519,15 +591,10 @@ void setup() {
 			Serial.println("Static IP configuration failed to apply!");
 		}
 
-		// 3. Sync calendar time from internet NTP (Only safe when online!)
-		Serial.println("Syncing calendar time from internet NTP...");
-		configTime(gmtOffset_sec, daylightOffset_sec, "pool.ntp.org");
-		
-		struct tm timeinfo;
-		if (getLocalTime(&timeinfo, 4000)) { 
-			Serial.println("System time synchronized successfully!");
-		} else {
-			Serial.println("NTP Sync timed out! Falling back to 'unknown' naming.");
+		// 3. Fall back to NTP here too, in case home Wi-Fi wasn't in range
+		// (or had no internet) at boot.
+		if (!timeSynced) {
+			timeSynced = syncTimeFromNTP();
 		}
 
 		// 4. Mount local system web routes
@@ -540,22 +607,15 @@ void setup() {
 			json += "\"voltage\":" + String(packVoltage) + ",";
 			json += "\"current\":" + String(packCurrent) + ",";
 			json += "\"cells\":[";
-			
-			int absoluteCellCounter = 0;
+
+			bool firstCell = true;
 			for (int m = 0; m < MAX_BMS_MODULES; m++) {
 				uint8_t cellsInThisModule = getModuleCellCount(m);
 				for (int c = 0; c < cellsInThisModule; c++) {
-					if (absoluteCellCounter < 26) {
-						json += String(bmsModules[m].volts[c]);
-						absoluteCellCounter++;
-						if (absoluteCellCounter < 26) json += ",";
-					}
+					if (!firstCell) json += ",";
+					json += String(bmsModules[m].volts[c]);
+					firstCell = false;
 				}
-			}
-			while (absoluteCellCounter < 26) {
-				json += "0";
-				absoluteCellCounter++;
-				if (absoluteCellCounter < 26) json += ",";
 			}
 			json += "]}";
 			server.send(200, "application/json", json);
@@ -588,7 +648,7 @@ void setup() {
 
 	sdSpi.begin(SD_SCK_PIN, SD_MISO_PIN, SD_MOSI_PIN, SD_CS_PIN);
 	
-	// Initialize SD File allocations using our auto-incrementing file counter mechanism
+	// Initialize SD File allocations
 	if (!SD.begin(SD_CS_PIN, sdSpi)) {
 		Serial.println("SD initialization failed. Check SD card wiring.");
 	} else {
@@ -596,31 +656,8 @@ void setup() {
 		Serial.println("SD initialized.");
 		purgeOldLogFiles();
 
-		char dateString[16];
-		getCurrentLogDate(dateString, sizeof(dateString));
-
-		char filename[32];
-		int sessionCounter = 1;
-
-		while (true) {
-			if (strcmp(dateString, "unknown") == 0) {
-				snprintf(filename, sizeof(filename), "/log-session-%02d.csv", sessionCounter);
-			} else {
-				snprintf(filename, sizeof(filename), "/log-%s-%02d.csv", dateString, sessionCounter);
-			}
-
-			if (!SD.exists(filename)) {
-				break; 
-			}
-			sessionCounter++;
-		}
-
-		logFile = SD.open(filename, FILE_WRITE);
-		if (logFile) {
-			strncpy(currentLogFileName, filename, sizeof(currentLogFileName));
-			currentLogFileName[sizeof(currentLogFileName) - 1] = '\0';
+		if (openLogFile()) {
 			Serial.printf("Logging enabled: %s\n", currentLogFileName);
-			writeLogHeader(logFile);
 			logFile.flush();
 		} else {
 			Serial.println("Failed to open log file for writing.");
@@ -766,7 +803,27 @@ void uploadLatestLogToGoogleDrive(const char* filepath) {
         return;
     }
 
-    Serial.printf("[Uploader] Initiating upload for file: %s (%d bytes)\n", correctPath.c_str(), fileToStream.size());
+    size_t fileSize = fileToStream.size();
+    Serial.printf("[Uploader] Initiating upload for file: %s (%d bytes)\n", correctPath.c_str(), fileSize);
+
+    // Read the whole file into RAM before touching Wi-Fi at all. Streaming it
+    // straight off the SD card while the radio is transmitting has been
+    // observed to disrupt SD SPI timing badly enough to fail the read mid-transfer.
+    uint8_t *fileBuffer = (uint8_t *)malloc(fileSize);
+    if (!fileBuffer) {
+        Serial.println("[Uploader] Failed to allocate upload buffer.");
+        fileToStream.close();
+        return;
+    }
+
+    size_t bytesRead = fileToStream.read(fileBuffer, fileSize);
+    fileToStream.close();
+
+    if (bytesRead != fileSize) {
+        Serial.println("[Uploader] Failed to read complete file from SD card.");
+        free(fileBuffer);
+        return;
+    }
 
     // Extract a clean name without the leading slash for the query parameter
     String cleanName = correctPath;
@@ -775,20 +832,42 @@ void uploadLatestLogToGoogleDrive(const char* filepath) {
     }
 
     // Create the parameter string block
-    String serverPath = "/macros/s/AKfycbwiWTMQR1hKmJWM5A8PRbAPcyz4c5JaZ8fS9T36bLT9mcSXhCDs6Cv_to7G9T21VBScqA/exec?filename=" + cleanName;
-    String fullUrl = "https://google.com" + serverPath;
+    String serverPath = String(SECRET_UPLOAD_SCRIPT_PATH) + "?filename=" + cleanName;
+    String fullUrl = "https://script.google.com" + serverPath;
 
     WiFiClientSecure client;
     client.setInsecure(); // Bypass strict Google certificate chains
 
     HTTPClient http;
     http.setTimeout(25000); // 25 seconds for slow cellular links
-    http.setFollowRedirects(HTTPC_STRICT_FOLLOW_REDIRECTS); 
+    // Handled manually below: Google Apps Script's /exec endpoint 302-redirects to a
+    // signed googleusercontent.com URL, and HTTPClient can't reliably resend a
+    // streamed file body when auto-following a redirect.
+    http.setFollowRedirects(HTTPC_DISABLE_FOLLOW_REDIRECTS);
 
     if (http.begin(client, fullUrl)) {
         http.addHeader("Content-Type", "text/csv");
 
-        int httpCode = http.sendRequest("POST", &fileToStream, fileToStream.size());
+        int httpCode = http.sendRequest("POST", fileBuffer, fileSize);
+        free(fileBuffer);
+
+        if (httpCode == HTTP_CODE_FOUND || httpCode == HTTP_CODE_MOVED_PERMANENTLY || httpCode == HTTP_CODE_TEMPORARY_REDIRECT) {
+            // Google has already executed doPost() and computed the result by this point;
+            // the redirect target just serves that result back and only accepts GET (no body).
+            String redirectUrl = http.getLocation();
+            http.end();
+
+            if (redirectUrl.length() > 0) {
+                Serial.println("[Uploader] Following redirect to execution result...");
+                if (http.begin(client, redirectUrl)) {
+                    httpCode = http.GET();
+                } else {
+                    Serial.println("[Uploader] Failed to initialize redirect connection handle.");
+                }
+            } else {
+                Serial.println("[Uploader] Redirect response missing Location header.");
+            }
+        }
 
         if (httpCode > 0) {
             String response = http.getString();
@@ -804,51 +883,13 @@ void uploadLatestLogToGoogleDrive(const char* filepath) {
         http.end();
     } else {
         Serial.println("[Uploader] Failed to initialize connection handle.");
+        free(fileBuffer);
     }
-
-    fileToStream.close();
 }
 
 
 void loop() {
 	static uint32_t lastPrint = 0;
-
-	if (WiFi.status() == WL_CONNECTED) {
-		Serial.println("\n[Idle Sensor] Connected to Home Network!");
-
-		// 1. ENGAGE SYNCHRONIZATION STATE OVERRIDE
-		isSynchronizing = true; 
-
-		// Disconnect cleanly and reconnect immediately without static config parameters
-		// This strips old cellular data assignments and pulls a fresh DHCP lease
-		WiFi.disconnect();
-		delay(150); 
-		WiFi.begin(home_ssid, home_password);
-		
-		// 2. BLOCK EXCLUSIVELY WHILE NEGOTIATING HANDSHAKE
-		int dhcpTimeout = 0;
-		while (WiFi.status() != WL_CONNECTED && dhcpTimeout < 30) {
-			delay(500);
-			Serial.print(".");
-			dhcpTimeout++;
-		}
-
-		if (WiFi.status() == WL_CONNECTED) {
-			Serial.print("\n[Idle Sensor] DHCP IP Successfully Assigned: ");
-			Serial.println(WiFi.localIP());
-			
-			// 3. EXECUTE THE SECURE GOOGLE SYNC PIPELINE
-			uploadLatestLogToGoogleDrive(currentLogFileName);
-		} else {
-			Serial.println("\n[Idle Sensor] DHCP Network handshake timed out.");
-		}
-
-		// 4. RESTORE VEHICLE INFRASTRUCTURE REGISTER TRACKING STATE
-		WiFi.disconnect(true);
-		WiFi.mode(WIFI_OFF);
-		isSynchronizing = false; // Re-enable background loops safely
-	}
-
 
 	// 1. Continuous high-speed CAN packet processing
 	twai_message_t message;
@@ -859,11 +900,12 @@ void loop() {
 	}
 
 	// 2. THE IDLE PROXIMITY ENGINE (Monitors home location arrival states)
-	if (packCurrent == 0) {
+	if (isPackIdle()) {
 		if (!trackingZeroCurrent) {
 			zeroCurrentStartTime = millis();
 			trackingZeroCurrent = true;
-			hasScannedThisIdleSession = false; 
+			hasScannedThisIdleSession = false;
+			Serial.print("Vehicle Idle...");
 		}
 		
 		// If current stays at exactly 0.0A for 15 seconds straight, scan for garage network
@@ -915,34 +957,17 @@ void loop() {
 				}
 				
 				if (WiFi.status() == WL_CONNECTED) {
-					Serial.println("\n[Idle Sensor] Connected to Home Network!");
-					
-					// 1. FORCE A NATIVE HANDSHAKE OVER DHCP
-					// Disconnect cleanly and reconnect immediately without any config overrides.
-					// This wipes the hardcoded static parameters and prompts the router for a fresh DHCP lease.
-					WiFi.disconnect();
-					delay(100); 
-					WiFi.begin(home_ssid, home_password);
-					
-					// 2. AWAIT COMPLETED NETWORK HANDSHAKE
-					int dhcpTimeout = 0;
-					while (WiFi.status() != WL_CONNECTED && dhcpTimeout < 15) {
-						delay(500);
-						Serial.print(".");
-						dhcpTimeout++;
-					}
+					Serial.print("\n[Idle Sensor] Connected to Home Network! IP: ");
+					Serial.println(WiFi.localIP());
 
-					if (WiFi.status() == WL_CONNECTED) {
-						Serial.print("\n[Idle Sensor] DHCP IP Successfully Assigned: ");
-						Serial.println(WiFi.localIP());
-						
-						// 3. EXECUTE THE SECURE SYNCHRONIZATION PIPELINE
-						uploadLatestLogToGoogleDrive(currentLogFileName);
-					} else {
-						Serial.println("\n[Idle Sensor] DHCP Handshake timed out.");
-						WiFi.disconnect(true);
-						WiFi.mode(WIFI_OFF);
-					}
+					// EXECUTE THE SECURE SYNCHRONIZATION PIPELINE
+					uploadLatestLogToGoogleDrive(currentLogFileName);
+					WiFi.disconnect(true);
+					WiFi.mode(WIFI_OFF);
+				} else {
+					Serial.println("\n[Idle Sensor] Home router connection timed out.");
+					WiFi.disconnect(true);
+					WiFi.mode(WIFI_OFF);
 				}
 
 			} else {
@@ -953,6 +978,9 @@ void loop() {
 		}
 	} else {
 		// Vehicle is drawing power or regen-braking! Reset tracking states instantly
+		if (trackingZeroCurrent && !hasScannedThisIdleSession) {
+			Serial.println(); // close off the "Vehicle Idle..." dot line
+		}
 		trackingZeroCurrent = false;
 		if (hasScannedThisIdleSession) {
 			WiFi.disconnect(true);
@@ -961,11 +989,13 @@ void loop() {
 		}
 	}
 
-	// 3. Keep-Alive Diagnostics print block (Only run if not synchronizing data!)
-	if (!isSynchronizing && (millis() - lastPrint >= 1000)) {
+	// 3. Keep-Alive Diagnostics print block
+	if (millis() - lastPrint >= 1000) {
 		lastPrint = millis();
-		if (packCurrent == 0) {
-			Serial.printf("Vehicle Idle... Proximity Scan Countdown: %lu/15s\n", (millis() - zeroCurrentStartTime) / 1000);
+		if (isPackIdle()) {
+			if (!hasScannedThisIdleSession) {
+				Serial.print(".");
+			}
 		} else {
 			Serial.println("Waiting for CAN data... [Bike Moving]");
 		}
