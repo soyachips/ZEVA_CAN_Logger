@@ -10,20 +10,36 @@ function doPost(e) {
     var folder = DriveApp.getFolderById(folderId);
 
     // 2. Extract configuration metadata headers sent from the ESP32
-    var filename = e.parameter.filename || "unnamed_ride.csv";
-    var csvRawData = e.postData.contents;
+    var filename = e.parameter.filename || "data.csv";
+    var isFirstChunk = e.parameter.first === "true";
+    var incoming = e.postData.contents;
 
-    // 3. Each upload sends the whole current day's log, not just new rows, so
-    // replace any existing file with the same name instead of creating a
-    // duplicate. Without this, every re-upload that day (one per time the
-    // vehicle parks at home) would leave another same-named file behind.
+    // 3. The firmware now sends one persistent filename and appends every
+    // sync onto it (rather than replacing it), since the device clears its
+    // own local copy once a sync succeeds — this file is the only place a
+    // day's (or ride's) data ends up living long-term. A large ride can
+    // arrive as several chunked requests; only the first chunk of a batch
+    // can contain a CSV header line, so only that one needs the check.
     var existingFiles = folder.getFilesByName(filename);
     var file;
     if (existingFiles.hasNext()) {
       file = existingFiles.next();
-      file.setContent(csvRawData);
+      var existing = file.getBlob().getDataAsString();
+
+      if (isFirstChunk) {
+        // Strip a leading header line so it doesn't end up duplicated
+        // partway through the combined file.
+        var newlineIdx = incoming.indexOf("\n");
+        if (newlineIdx !== -1 && incoming.substring(0, newlineIdx).indexOf("timestamp") === 0) {
+          incoming = incoming.substring(newlineIdx + 1);
+        }
+      }
+
+      file.setContent(existing + incoming);
     } else {
-      var blob = Utilities.newBlob(csvRawData, "text/csv", filename);
+      // First-ever sync: nothing to append to yet, so the incoming content
+      // (header included) becomes the whole file.
+      var blob = Utilities.newBlob(incoming, "text/csv", filename);
       file = folder.createFile(blob);
     }
 

@@ -22,6 +22,13 @@ const char* home_password = SECRET_HOME_PASSWORD;
 const char* ntpServer = "pool.ntp.org";
 const long  gmtOffset_sec = 10 * 3600;     // UTC +10 hours (AEST)
 const int   daylightOffset_sec = 3600;     // 1 hour daylight savings shift
+static const int NTP_SYNC_MAX_ATTEMPTS = 3;
+static const uint32_t NTP_SYNC_TIMEOUT_MS = 4000; // 1000ms was too short for a real DNS lookup + UDP round trip
+// WiFi is busiest right after association (DHCP, ARP) in its own background
+// task, independent of our sequential code — a brief pause here before any
+// SD activity reduces (doesn't guarantee zero) the odds of an SD/WiFi
+// electrical collision on marginal wiring/power.
+static const uint32_t WIFI_SETTLE_DELAY_MS = 500;
 
 // --- PROXIMITY ENGINE TRACKING VARIABLES ---
 static uint32_t zeroCurrentStartTime = 0;
@@ -300,119 +307,172 @@ static const int SD_CS_PIN = 27;
 static const int SD_MISO_PIN = 19;
 static const int SD_MOSI_PIN = 23;
 static const int SD_SCK_PIN = 18;
-static const int MAX_LOG_FILE_DAYS = 7;
 static SPIClass sdSpi(VSPI);
 static File logFile;
-static char currentLogFileName[32] = "";
+// A single generic data file rather than one per day: the backend now
+// appends every sync onto one persistent Drive file regardless of when the
+// data came from, so there's no need to distinguish local files by date —
+// the local file only ever holds whatever hasn't been synced yet, and gets
+// deleted once a sync fully succeeds (see the idle-sync block in loop()).
+static const char *DATA_FILE_PATH = "/data.csv";
+// Persists how many bytes of DATA_FILE_PATH have already been successfully
+// synced. A backlog (long ride, or several unsynced short ones) can exceed
+// what fits in RAM at once, so a sync only has to read/upload as much as
+// currently fits, then record how far it got here — the next idle period
+// picks up from this offset instead of needing the whole file to fit in one
+// pass. Only ever reset (deleted) once the file is fully drained, or when a
+// brand-new data file is created (see openDataFile()) since a stale offset
+// from a previous file's lifetime can't apply to a new one.
+static const char *SYNC_OFFSET_PATH = "/data.offset";
 static bool sdInitialized = false;
 // Only true once NTP has synced this boot; gates whether we write rows to SD
 // at all, since log timestamps are wall-clock based and meaningless without it.
 static bool timeSynced = false;
 
+// --- DEBUG/EVENT LOG ---
+// A single evergreen text file that mirrors boot/connectivity/upload events
+// (not raw telemetry) to SD with a timestamp on each line, so a run can be
+// inspected afterward with no serial monitor attached (e.g. battery testing).
+// Disabled for now: SD writes during active WiFi (search/connect/NTP) were
+// triggering sdCommand() failures on this hardware, and the CSV data logging
+// ran fine on its own without this extra SD traffic. Flip back to true to
+// re-enable once the underlying SD/WiFi issue is resolved (e.g. decoupling
+// capacitor added) — nothing else needs to change, DebugLog just falls
+// through to Serial-only while this is off.
+static const bool DEBUG_LOG_ENABLED = false;
+static const char *DEBUG_LOG_PATH = "/log.txt";
+static File debugFile;
+
+static bool openDebugLogFile() {
+	if (!DEBUG_LOG_ENABLED || !sdInitialized) return false;
+	if (debugFile) debugFile.close();
+	debugFile = SD.open(DEBUG_LOG_PATH, FILE_APPEND);
+	return (bool)debugFile;
+}
+
+static void formatDebugTimestamp(char *buf, size_t size) {
+	// Check the clock directly rather than the timeSynced flag: configTime()
+	// takes effect immediately, before the caller gets a chance to set that
+	// flag, so this is accurate even for the sync-succeeded message itself.
+	time_t now = time(nullptr);
+	if (now > 24 * 3600) {
+		struct tm timeinfo;
+		localtime_r(&now, &timeinfo);
+		strftime(buf, size, "%Y-%m-%d %H:%M:%S", &timeinfo);
+	} else {
+		// Clock isn't synced yet (or never syncs this boot) — still useful to
+		// know when in the boot timeline something happened.
+		snprintf(buf, size, "boot+%lums", (unsigned long)millis());
+	}
+}
+
+// Mirrors Print output to both the real Serial port and the debug log file.
+// Writes go to SD immediately (nothing sits buffered in RAM waiting for a
+// future newline), but flushing is rate-limited: a WiFi search/connect loop
+// calls print(".") up to ~20 times over 10s, and forcing a physical SD flush
+// on every single one of those hammers the card during WiFi's busiest window
+// (association, DHCP) — observed to trigger SD errors on marginal wiring. So
+// we always flush when a line starts (a crash still records that something
+// began) and when a line completes, but a run of dots in between only forces
+// a flush if it's been a while, as a safety net for a genuine stall.
+class TeeLogger : public Print {
+public:
+	size_t write(uint8_t c) override {
+		if (writeByte(c)) doFlush();
+		return Serial.write(c);
+	}
+
+	size_t write(const uint8_t *buffer, size_t size) override {
+		bool shouldFlush = false;
+		for (size_t i = 0; i < size; ++i) {
+			if (writeByte(buffer[i])) shouldFlush = true;
+		}
+		if (shouldFlush) doFlush();
+		return Serial.write(buffer, size);
+	}
+
+private:
+	bool atLineStart = true;
+	uint32_t lastFlushMs = 0;
+	static const uint32_t MAX_FLUSH_INTERVAL_MS = 3000;
+
+	// Returns true if this byte is a point worth flushing at.
+	bool writeByte(uint8_t c) {
+		if (!debugFile) return false;
+		if (c == '\r') return false; // normalize CRLF -> LF
+		if (c == '\n') {
+			if (!atLineStart) {
+				debugFile.write((uint8_t)'\n');
+				atLineStart = true;
+				return true; // line completed
+			}
+			return false; // blank line, swallowed
+		}
+		bool lineJustStarted = false;
+		if (atLineStart) {
+			char stamp[24];
+			formatDebugTimestamp(stamp, sizeof(stamp));
+			debugFile.printf("[%s] ", stamp);
+			atLineStart = false;
+			lineJustStarted = true;
+		}
+		debugFile.write(c);
+		if (lineJustStarted) return true; // line started
+		return (millis() - lastFlushMs) >= MAX_FLUSH_INTERVAL_MS; // stall safety net
+	}
+
+	void doFlush() {
+		debugFile.flush();
+		lastFlushMs = millis();
+	}
+};
+
+static TeeLogger DebugLog;
+
 static void writeLogHeader(File &file);
 
-static void getCurrentLogDate(char *dateString, size_t size) {
-	// Only ever called once timeSynced is true, so the clock is always valid here.
-	time_t now = time(nullptr);
-	struct tm timeinfo;
-	localtime_r(&now, &timeinfo);
-	strftime(dateString, size, "%Y%m%d", &timeinfo);
+static size_t readSyncOffset() {
+	if (!SD.exists(SYNC_OFFSET_PATH)) return 0; // avoids a noisy vfs_api.cpp error for the common no-offset-yet case
+	File f = SD.open(SYNC_OFFSET_PATH, FILE_READ);
+	if (!f) return 0;
+	char buf[16] = {0};
+	size_t n = f.read((uint8_t *)buf, sizeof(buf) - 1);
+	f.close();
+	buf[n] = '\0';
+	long val = atol(buf);
+	return val > 0 ? (size_t)val : 0;
 }
 
-// Resolves to the same filename for the whole boot session: once resolved it
-// doesn't change until reboot, and callers rely on getting back the exact
-// same name every time they ask.
-static void getLogFileName(char *filename, size_t size) {
-	static char resolvedName[32] = "";
-
-	if (resolvedName[0] == '\0') {
-		char dateString[16];
-		getCurrentLogDate(dateString, sizeof(dateString));
-		// One file per calendar day; purgeOldLogFiles() rotates these out.
-		snprintf(resolvedName, sizeof(resolvedName), "/log-%s.csv", dateString);
-	}
-
-	strncpy(filename, resolvedName, size);
-	filename[size - 1] = '\0';
+// Removes and recreates the offset file rather than overwriting in place —
+// FILE_WRITE doesn't truncate, so a shorter new value (e.g. "512" replacing
+// "268729") would otherwise leave trailing digits from the old one behind.
+static void writeSyncOffset(size_t offset) {
+	if (SD.exists(SYNC_OFFSET_PATH)) SD.remove(SYNC_OFFSET_PATH);
+	File f = SD.open(SYNC_OFFSET_PATH, FILE_WRITE);
+	if (!f) return;
+	f.print(offset);
+	f.close();
 }
 
-static void purgeOldLogFiles() {
-	if (!sdInitialized) return;
-
-	File root = SD.open("/");
-	if (!root) return;
-
-	const int maxFiles = MAX_LOG_FILE_DAYS + 8;
-	char logFiles[maxFiles][32];
-	int fileCount = 0;
-
-	while (true) {
-		File entry = root.openNextFile();
-		if (!entry) break;
-		if (!entry.isDirectory()) {
-			const char *name = entry.name();
-			int len = strlen(name);
-			if (len == 16 && strncmp(name, "log-", 4) == 0 && strcmp(name + 12, ".csv") == 0) {
-				if (fileCount < maxFiles) {
-					strcpy(logFiles[fileCount++], name);
-				}
-			}
-		}
-		entry.close();
-	}
-	root.close();
-
-	if (fileCount <= MAX_LOG_FILE_DAYS) return;
-
-	for (int i = 0; i < fileCount - 1; ++i) {
-		for (int j = i + 1; j < fileCount; ++j) {
-			if (strcmp(logFiles[i], logFiles[j]) > 0) {
-				char temp[32];
-				strcpy(temp, logFiles[i]);
-				strcpy(logFiles[i], logFiles[j]);
-				strcpy(logFiles[j], temp);
-			}
-		}
-	}
-
-	for (int i = 0; i < fileCount - MAX_LOG_FILE_DAYS; ++i) {
-		char path[40];
-		if (logFiles[i][0] == '/') {
-			snprintf(path, sizeof(path), "%s", logFiles[i]);
-		} else {
-			snprintf(path, sizeof(path), "/%s", logFiles[i]);
-		}
-		SD.remove(path);
-	}
+static void clearSyncOffset() {
+	if (SD.exists(SYNC_OFFSET_PATH)) SD.remove(SYNC_OFFSET_PATH);
 }
 
-static bool openLogFile() {
+static bool openDataFile() {
 	if (!sdInitialized) return false;
+	if (logFile) return true; // already open
 
-	char filename[32];
-	getLogFileName(filename, sizeof(filename));
-	if (strcmp(filename, currentLogFileName) == 0 && logFile) {
-		return true;
-	}
+	bool isNewFile = !SD.exists(DATA_FILE_PATH);
 
-	if (logFile) {
-		logFile.close();
-		currentLogFileName[0] = '\0';
-	}
-
-	bool isNewFile = !SD.exists(filename);
-
-	logFile = SD.open(filename, FILE_APPEND);
+	logFile = SD.open(DATA_FILE_PATH, FILE_APPEND);
 	if (!logFile) {
 		return false;
 	}
 
 	if (isNewFile) {
 		writeLogHeader(logFile);
+		clearSyncOffset(); // a leftover offset can't apply to this new file
 	}
-
-	strncpy(currentLogFileName, filename, sizeof(currentLogFileName));
-	currentLogFileName[sizeof(currentLogFileName) - 1] = '\0';
 	return true;
 }
 
@@ -486,11 +546,11 @@ void printPackVoltages(uint32_t timestamp) {
 	// ONLY write to the SD card if the clock is synced (timestamps are wall-clock
 	// based) and current is outside the idle deadband (charging or discharging)
 	if (sdInitialized && timeSynced && !isPackIdle()) {
-		if (openLogFile()) {
+		if (openDataFile()) {
 			logFile.println(buffer);
 			logFile.flush(); // Safely saves data to the flash sector
 		} else {
-			Serial.println("Failed to rotate/open log file.");
+			DebugLog.println("Failed to open data file.");
 		}
 	}
 }
@@ -502,30 +562,38 @@ bool setupCAN() {
 
 	esp_err_t err = twai_driver_install(&general_config, &timing_config, &filter_config);
 	if (err != ESP_OK) {
-		Serial.printf("TWAI driver install failed: %d\n", err);
+		DebugLog.printf("TWAI driver install failed: %d\n", err);
 		return false;
 	}
 
 	err = twai_start();
 	if (err != ESP_OK) {
-		Serial.printf("TWAI start failed: %d\n", err);
+		DebugLog.printf("TWAI start failed: %d\n", err);
 		return false;
 	}
 
-	Serial.printf("CAN initialized at %u kbps\n", CAN_SPEED / 1000);
+	DebugLog.printf("CAN initialized at %u kbps\n", CAN_SPEED / 1000);
 	return true;
 }
 
 static bool syncTimeFromNTP() {
-	Serial.println("Syncing calendar time from internet NTP...");
-	configTime(gmtOffset_sec, daylightOffset_sec, ntpServer);
+	for (int attempt = 1; attempt <= NTP_SYNC_MAX_ATTEMPTS; ++attempt) {
+		DebugLog.printf("Syncing calendar time from internet NTP (attempt %d/%d)...\n", attempt, NTP_SYNC_MAX_ATTEMPTS);
+		// Re-issued each attempt, not just re-waited on: a single lost NTP
+		// packet would otherwise leave nothing to retry within the timeout.
+		configTime(gmtOffset_sec, daylightOffset_sec, ntpServer);
 
-	struct tm timeinfo;
-	if (getLocalTime(&timeinfo, 4000)) {
-		Serial.println("System time synchronized successfully!");
-		return true;
+		struct tm timeinfo;
+		if (getLocalTime(&timeinfo, NTP_SYNC_TIMEOUT_MS)) {
+			DebugLog.println("System time synchronized successfully!");
+			return true;
+		}
+
+		if (attempt < NTP_SYNC_MAX_ATTEMPTS) {
+			delay(500);
+		}
 	}
-	Serial.println("NTP Sync timed out.");
+	DebugLog.println("NTP Sync timed out after multiple attempts.");
 	return false;
 }
 
@@ -533,33 +601,56 @@ void setup() {
 	Serial.begin(115200);
 	delay(1000);
 
+	// Bring up the SD card and the debug log first, before any WiFi activity,
+	// so the boot/connectivity sequence below gets captured to /log.txt even
+	// with no serial monitor attached.
+	pinMode(SD_CS_PIN, OUTPUT);
+	digitalWrite(SD_CS_PIN, HIGH);
+	delay(10);
+	sdSpi.begin(SD_SCK_PIN, SD_MISO_PIN, SD_MOSI_PIN, SD_CS_PIN);
+
+	if (!SD.begin(SD_CS_PIN, sdSpi)) {
+		Serial.println("SD initialization failed. Check SD card wiring.");
+	} else {
+		sdInitialized = true;
+		Serial.println("SD initialized.");
+		if (!openDebugLogFile()) {
+			if (DEBUG_LOG_ENABLED) {
+				Serial.println("Failed to open debug log file; continuing with Serial only.");
+			} else {
+				Serial.println("Debugging turned off.");
+			}
+		}
+	}
+
 	WiFi.mode(WIFI_STA);
 
 	// 0. If we're already in range of home Wi-Fi (e.g. starting the ride from
-	// home), connect briefly just to sync the clock before the log file for
+	// home), connect briefly just to sync the clock before the data file for
 	// this session gets named further down.
-	Serial.print("Checking for Home Wi-Fi (10s timeout)");
+	DebugLog.print("Checking for Home Wi-Fi (10s timeout)");
 	WiFi.begin(home_ssid, home_password);
 
 	int homeAttemptCounter = 0;
 	while (WiFi.status() != WL_CONNECTED && homeAttemptCounter < 20) {
 		delay(500);
-		Serial.print(".");
+		DebugLog.print(".");
 		homeAttemptCounter++;
 	}
 
 	if (WiFi.status() == WL_CONNECTED) {
-		Serial.println("\nHome Wi-Fi found.");
+		DebugLog.println("\nHome Wi-Fi found.");
+		delay(WIFI_SETTLE_DELAY_MS); // let association/DHCP traffic settle before more SD activity
 		timeSynced = syncTimeFromNTP();
 		WiFi.disconnect();
 		delay(200);
 	} else {
-		Serial.println("\nHome Wi-Fi not found at boot.");
+		DebugLog.println("\nHome Wi-Fi not found at boot.");
 	}
 
 	// 1. Set wireless station properties
 	WiFi.begin(ssid, password);
-	Serial.print("Searching for Hotspot (10s timeout)");
+	DebugLog.print("Searching for Hotspot (10s timeout)");
 
 	int attemptCounter = 0;
 	bool wifiConnected = true;
@@ -567,7 +658,7 @@ void setup() {
 	// Loop 20 times with a 500ms delay = 10 seconds total tracking window
 	while (WiFi.status() != WL_CONNECTED) {
 		delay(500);
-		Serial.print(".");
+		DebugLog.print(".");
 		attemptCounter++;
 
 		if (attemptCounter >= 20) {
@@ -578,13 +669,14 @@ void setup() {
 
 	// BRANCH A: ONLINE MODE (Hotspot Found!)
 	if (wifiConnected) {
-		Serial.println("\nConnected successfully!!! Network node established.");
-		Serial.print("IP Address: ");
-		Serial.println(WiFi.localIP());
+		DebugLog.println("\nConnected successfully!!! Network node established.");
+		delay(WIFI_SETTLE_DELAY_MS); // let association/DHCP traffic settle before more SD activity
+		DebugLog.print("IP Address: ");
+		DebugLog.println(WiFi.localIP());
 
 		// 2. Request chosen static IP configuration allocation
 		if (!WiFi.config(local_IP, gateway, subnet, primaryDNS)) {
-			Serial.println("Static IP configuration failed to apply!");
+			DebugLog.println("Static IP configuration failed to apply!");
 		}
 
 		// 3. Fall back to NTP here too, in case home Wi-Fi wasn't in range
@@ -620,51 +712,42 @@ void setup() {
 		// 5. Initialize the WebOTA Dashboard Interface and Start Server
 		ElegantOTA.begin(&server);
 		server.begin();
-		Serial.println("Web Server initialized.");
+		DebugLog.println("Web Server initialized.");
 
 	// BRANCH B: OFFLINE MODE (Hotspot Missing)
 	} else {
-		Serial.println("\nHotspot not found. Switching to Offline Logger Mode.");
-		WiFi.disconnect(true); 
+		DebugLog.println("\nHotspot not found. Switching to Offline Logger Mode.");
+		WiFi.disconnect(true);
 		WiFi.mode(WIFI_OFF); // Power off antenna arrays completely
 	}
 
 	// BOTH BRANCHES CONTINUOUSLY RUN INDEPENDENT HARDWARE CONFIGURATIONS BELOW HERE
-	Serial.println("ZEVA ESP32 CAN cell voltage logger");
-	Serial.println("Waiting for CAN data...");
+	DebugLog.println("ZEVA ESP32 CAN cell voltage logger");
+	DebugLog.println("Waiting for CAN data...");
 
 	if (!setupCAN()) {
-		Serial.println("CAN initialization failed. Check CAN wiring and transceiver.");
+		DebugLog.println("CAN initialization failed. Check CAN wiring and transceiver.");
 	}
 
-	// Ensure CS is an output and driven HIGH before initializing SPI/SD.
-	pinMode(SD_CS_PIN, OUTPUT);
-	digitalWrite(SD_CS_PIN, HIGH);
-	delay(10);
-
-	sdSpi.begin(SD_SCK_PIN, SD_MISO_PIN, SD_MOSI_PIN, SD_CS_PIN);
-	
-	// Initialize SD File allocations
-	if (!SD.begin(SD_CS_PIN, sdSpi)) {
-		Serial.println("SD initialization failed. Check SD card wiring.");
-	} else {
-		sdInitialized = true;
-		Serial.println("SD initialized.");
-		purgeOldLogFiles();
-
+	// SD card is already mounted (see top of setup()); now that the clock
+	// situation is known, open (or resume appending to) the data file if synced.
+	if (sdInitialized) {
 		if (timeSynced) {
-			if (openLogFile()) {
-				Serial.printf("Logging enabled: %s\n", currentLogFileName);
+			if (openDataFile()) {
+				DebugLog.printf("Logging enabled: %s\n", DATA_FILE_PATH);
 				logFile.flush();
 			} else {
-				Serial.println("Failed to open log file for writing.");
+				DebugLog.println("Failed to open data file for writing.");
 			}
 		} else {
-			Serial.println("Time not synced this boot; SD logging disabled for this session.");
+			DebugLog.println("Time not synced this boot; SD logging disabled for this session.");
 		}
 	}
 
 	memset(bmsModules, 0, sizeof(bmsModules));
+
+	Serial.printf("[Heap] End of setup — free: %u, largest block: %u\n",
+		(unsigned)ESP.getFreeHeap(), (unsigned)ESP.getMaxAllocHeap());
 }
 
 
@@ -750,113 +833,202 @@ void processBmsMessage(uint32_t packetId, const uint8_t data[8], size_t length) 
 #include <HTTPClient.h>
 #include <WiFiClientSecure.h>
 
-void uploadLatestLogToGoogleDrive(const char* filepath) {
-    if (WiFi.status() != WL_CONNECTED) {
-        Serial.println("[Uploader] Error: Wi-Fi disconnected.");
-        return;
-    }
+// A ride's worth of data can exceed what fits in one RAM allocation (seen in
+// practice: many short rides sharing one growing file). Reading/uploading in
+// chunks instead of one big buffer avoids needing a single large contiguous
+// allocation.
+//
+// The chunk size is adaptive rather than fixed: testing showed a 32KB
+// malloc() fail with 244KB free heap and a 110KB largest block reported
+// available, and — after shrinking to 16KB specifically to stay under a
+// ~40KB floor observed during that failure — a 16KB malloc() then ALSO fail
+// with a 40KB largest block still reported available. In both cases the
+// reported "largest free block" was comfortably bigger than the request that
+// failed, so it isn't a reliable predictor of what will actually succeed
+// here. Rather than continuing to guess a fixed "safe" size against numbers
+// that don't seem to line up with reality, mallocChunkAdaptive() just tries
+// the preferred size and halves it on failure until something works (or a
+// floor is hit), and reads exactly that much — so chunk sizes vary at
+// runtime based on what's actually available, not a static guess.
+static const size_t UPLOAD_CHUNK_SIZE = 16384;
+static const size_t MIN_UPLOAD_CHUNK_SIZE = 512;
+static const int MAX_UPLOAD_CHUNKS = 128;
+// Hard cap on total bytes read into RAM in one batch, independent of how
+// much more memory is technically available. Found the real cause of every
+// "mystery" heap failure chased earlier: reading everything that would fit
+// (once, 196KB across 26 chunks) starved WiFi of the memory it needs to
+// initialize its own task/buffers on the way back up afterward
+// (`wifi:create wifi task: failed to create task`). Capping how much we ever
+// hold at once guarantees WiFi has room to start regardless of exactly how
+// much total heap turns out to be available at that moment.
+static const size_t MAX_BATCH_BYTES = 32768;
 
-    // 1. SELF-HEALING: RE-INITIALIZE THE SD CARD IF THE RADIO CRASHED IT
-    Serial.println("[Uploader] Checking SD Card stability...");
-    SD.end(); // Clear hanging driver handles
-    delay(200);
-    
-    // Re-initialize the SPI / SD lines cleanly
-    if (!SD.begin(SD_CS_PIN, sdSpi)) {
-        Serial.println("[Uploader] CRITICAL: SD Card failed to wake up after WiFi boot! Retrying once...");
-        delay(500);
-        if (!SD.begin(SD_CS_PIN, sdSpi)) {
-            Serial.println("[Uploader] CRITICAL: SD Card hardware unrecoverable.");
-            return;
+struct UploadChunk {
+    uint8_t *data;
+    size_t length;
+};
+
+// Tries `desired` bytes, halving on failure down to MIN_UPLOAD_CHUNK_SIZE.
+// Returns the buffer and sets *outSize to whatever size actually succeeded,
+// or returns nullptr if even the floor size failed.
+static uint8_t *mallocChunkAdaptive(size_t desired, size_t *outSize) {
+    size_t trySize = desired;
+    while (trySize >= MIN_UPLOAD_CHUNK_SIZE) {
+        uint8_t *buf = (uint8_t *)malloc(trySize);
+        if (buf) {
+            *outSize = trySize;
+            return buf;
         }
+        trySize /= 2;
     }
-    Serial.println("[Uploader] SD Card communication restored.");
+    *outSize = 0;
+    return nullptr;
+}
 
-    // 2. PATH SANITIZATION & EMPTY STRING FALLBACK
-    String correctPath = String(filepath);
-    correctPath.trim();
+// Single-attempt chunked read (see readDataFileToChunks() for the retry
+// wrapper), starting at startOffset (bytes already synced from a previous
+// batch). *outBytesRead is the total across all chunks in this batch;
+// *outReachedEOF says whether this batch reached the end of the file (i.e.
+// nothing will remain unsynced once this batch uploads), or stopped early
+// (hit the chunk cap, or ran out of memory) with more left for next time —
+// CAN reception is blocked for the whole sync attempt, so the file can't
+// grow out from under this read mid-way.
+//
+// Returns the chunk count (>= 0, possibly 0 at genuine EOF) on any run that
+// made progress or found nothing left to do. Only returns -1 — a real
+// failure worth retrying via readDataFileToChunks()'s SD reinit — for an
+// actual I/O problem (open/seek/short-read), or hitting the memory ceiling
+// before a single chunk could be read at all. Running out of memory *after*
+// reading at least one chunk is treated as a normal stopping point, not a
+// failure: whatever was read is still good data, worth uploading and
+// resuming from rather than discarding and starting over.
+static int readDataFileToChunksOnce(UploadChunk *chunks, int maxChunks, size_t startOffset, size_t *outBytesRead, bool *outReachedEOF) {
+    File fileToStream = SD.open(DATA_FILE_PATH, FILE_READ);
+    if (!fileToStream) {
+        DebugLog.println("[Uploader] Failed to open data file for reading.");
+        return -1;
+    }
+    if (startOffset > 0 && !fileToStream.seek(startOffset)) {
+        DebugLog.println("[Uploader] Failed to seek to sync offset.");
+        fileToStream.close();
+        return -1;
+    }
 
-    // If the tracking variable is empty, fall back to the standard session naming convention
-    if (correctPath == "" || correctPath == "/") {
-        Serial.println("[Uploader] Warning: Tracked filename was empty. Scanning for session fallback file...");
-        
-        // Scan for the most likely un-synchronized log file structure on your root card
-        if (SD.exists("/log-session-01.csv")) {
-            correctPath = "/log-session-01.csv";
-        } else if (SD.exists("/log-session.csv")) {
-            correctPath = "/log-session.csv";
-        } else {
-            Serial.println("[Uploader] Error: No valid session files found on SD card root directory.");
-            return;
+    int chunkCount = 0;
+    size_t totalBytes = 0;
+    bool ioFailure = false;
+    while (fileToStream.available() > 0) {
+        if (chunkCount >= maxChunks) {
+            // Not a failure — upload what we have and continue from here next sync.
+            DebugLog.printf("[Uploader] Batch limit (%d chunks) reached; remaining data will sync next time.\n", maxChunks);
+            break;
         }
+        if (totalBytes >= MAX_BATCH_BYTES) {
+            // Not a failure either — deliberately stop well short of "everything
+            // that fits" so WiFi has enough free heap left to start up afterward.
+            DebugLog.printf("[Uploader] Batch size cap (%u bytes) reached; remaining data will sync next time.\n", (unsigned)MAX_BATCH_BYTES);
+            break;
+        }
+
+        size_t desired = (size_t)fileToStream.available();
+        if (desired > UPLOAD_CHUNK_SIZE) desired = UPLOAD_CHUNK_SIZE;
+
+        size_t toRead = 0;
+        uint8_t *buf = mallocChunkAdaptive(desired, &toRead);
+        if (!buf) {
+            // Also not a failure if we already have something: stop here,
+            // upload what fit, and continue from this point next sync.
+            DebugLog.printf("[Uploader] Out of memory for further chunks (have %d so far); uploading that and continuing next sync. Free heap: %u, largest block: %u\n",
+                chunkCount, (unsigned)ESP.getFreeHeap(), (unsigned)ESP.getMaxAllocHeap());
+            break;
+        }
+        if (toRead < desired) {
+            DebugLog.printf("[Uploader] Wanted %u-byte chunk, only got %u; continuing with smaller chunks.\n",
+                (unsigned)desired, (unsigned)toRead);
+        }
+
+        size_t got = fileToStream.read(buf, toRead);
+        if (got != toRead) {
+            DebugLog.println("[Uploader] Short read while chunking data file.");
+            free(buf);
+            ioFailure = true;
+            break;
+        }
+
+        chunks[chunkCount].data = buf;
+        chunks[chunkCount].length = got;
+        totalBytes += got;
+        chunkCount++;
+    }
+    bool reachedEOF = !ioFailure && (fileToStream.available() == 0);
+    fileToStream.close();
+
+    if (ioFailure) {
+        for (int i = 0; i < chunkCount; ++i) free(chunks[i].data);
+        return -1;
+    }
+    if (chunkCount == 0 && !reachedEOF) {
+        // Couldn't make any progress at all this attempt (out of memory
+        // before even the first chunk) — signal failure so the retry
+        // wrapper gives it another shot rather than reporting a hollow
+        // "success" with nothing to actually upload.
+        return -1;
     }
 
-    if (!correctPath.startsWith("/")) {
-        correctPath = "/" + correctPath;
-    }
+    *outBytesRead = totalBytes;
+    *outReachedEOF = reachedEOF;
+    return chunkCount;
+}
 
-    // Read the whole file into RAM before touching Wi-Fi endpoints. Even with
-    // WiFi already connected (not mid-transmit), the SD bus can still glitch
-    // mid-read and leave the card unresponsive to subsequent commands — a
-    // plain reopen won't recover from that, so retry with a full SD reinit
-    // between attempts before giving up on this sync.
+// Reads (a batch of, starting at startOffset) the data file into RAM chunks.
+// Meant to be called while WiFi is off — the only time SD access on this
+// hardware is guaranteed not to collide with active radio transmission — so
+// the later upload step needs no more SD access at all, regardless of how
+// busy WiFi gets while connecting/sending. Returns the chunk count (>= 0) on
+// success, or -1 on failure.
+//
+// SD is already mounted from setup() and hasn't been touched by WiFi since
+// (the radio's been off this whole idle period), so the first attempt just
+// reads directly rather than reinitializing SD first — repeated SD.end()/
+// SD.begin() cycles were observed to leak a large amount of heap (~130KB in
+// one case) on this SD library, and the "radio might have crashed it"
+// justification for reiniting preemptively no longer applies now that SD
+// access never overlaps with WiFi. The reinit is kept as an actual recovery
+// step for retries, since the SD bus can still glitch mid-read on its own.
+static int readDataFileToChunks(UploadChunk *chunks, int maxChunks, size_t startOffset, size_t *outBytesRead, bool *outReachedEOF) {
     const int MAX_READ_ATTEMPTS = 3;
-    uint8_t *fileBuffer = nullptr;
-    size_t fileSize = 0;
-    bool readOk = false;
-
-    for (int attempt = 1; attempt <= MAX_READ_ATTEMPTS && !readOk; ++attempt) {
+    for (int attempt = 1; attempt <= MAX_READ_ATTEMPTS; ++attempt) {
         if (attempt > 1) {
-            Serial.printf("[Uploader] Retrying SD read (attempt %d/%d)...\n", attempt, MAX_READ_ATTEMPTS);
+            DebugLog.printf("[Uploader] Retrying SD read (attempt %d/%d)...\n", attempt, MAX_READ_ATTEMPTS);
             SD.end();
             delay(200);
             if (!SD.begin(SD_CS_PIN, sdSpi)) {
-                Serial.println("[Uploader] SD reinit failed during retry.");
+                DebugLog.println("[Uploader] SD reinit failed during retry.");
                 continue;
             }
+            openDebugLogFile(); // reinit above invalidated the debug file handle too
         }
 
-        File fileToStream = SD.open(correctPath.c_str(), FILE_READ);
-        if (!fileToStream) {
-            Serial.printf("[Uploader] Failed to open log file target path: %s\n", correctPath.c_str());
-            continue;
-        }
-
-        fileSize = fileToStream.size();
-        uint8_t *buffer = (uint8_t *)malloc(fileSize);
-        if (!buffer) {
-            Serial.println("[Uploader] Failed to allocate upload buffer.");
-            fileToStream.close();
-            return; // won't improve on retry
-        }
-
-        size_t bytesRead = fileToStream.read(buffer, fileSize);
-        fileToStream.close();
-
-        if (bytesRead == fileSize) {
-            fileBuffer = buffer;
-            readOk = true;
-        } else {
-            Serial.println("[Uploader] Failed to read complete file from SD card.");
-            free(buffer);
+        int chunkCount = readDataFileToChunksOnce(chunks, maxChunks, startOffset, outBytesRead, outReachedEOF);
+        if (chunkCount >= 0) {
+            DebugLog.printf("[Uploader] Read %u bytes into %d chunk(s) from offset %u%s.\n",
+                (unsigned)*outBytesRead, chunkCount, (unsigned)startOffset, *outReachedEOF ? " (reached end of file)" : "");
+            return chunkCount;
         }
     }
 
-    if (!readOk) {
-        Serial.println("[Uploader] Giving up after repeated SD read failures.");
-        return;
-    }
+    DebugLog.println("[Uploader] Giving up after repeated SD read failures.");
+    return -1;
+}
 
-    Serial.printf("[Uploader] Initiating upload for file: %s (%d bytes)\n", correctPath.c_str(), fileSize);
+// POSTs one chunk; the backend appends it to the persistent Drive file
+// (isFirstChunk tells it whether to strip a leading header line, since only
+// the first chunk of a batch can contain one). No SD access — call only once
+// WiFi is connected.
+static bool uploadOneChunk(uint8_t *buffer, size_t size, bool isFirstChunk) {
+    DebugLog.printf("[Uploader] Uploading chunk (%d bytes, first=%s)...\n", (int)size, isFirstChunk ? "true" : "false");
 
-    // Extract a clean name without the leading slash for the query parameter
-    String cleanName = correctPath;
-    if (cleanName.startsWith("/")) {
-        cleanName = cleanName.substring(1);
-    }
-
-    // Create the parameter string block
-    String serverPath = String(SECRET_UPLOAD_SCRIPT_PATH) + "?filename=" + cleanName;
+    String serverPath = String(SECRET_UPLOAD_SCRIPT_PATH) + "?filename=data.csv&first=" + (isFirstChunk ? "true" : "false");
     String fullUrl = "https://script.google.com" + serverPath;
 
     WiFiClientSecure client;
@@ -869,11 +1041,12 @@ void uploadLatestLogToGoogleDrive(const char* filepath) {
     // streamed file body when auto-following a redirect.
     http.setFollowRedirects(HTTPC_DISABLE_FOLLOW_REDIRECTS);
 
+    bool success = false;
+
     if (http.begin(client, fullUrl)) {
         http.addHeader("Content-Type", "text/csv");
 
-        int httpCode = http.sendRequest("POST", fileBuffer, fileSize);
-        free(fileBuffer);
+        int httpCode = http.sendRequest("POST", buffer, size);
 
         if (httpCode == HTTP_CODE_FOUND || httpCode == HTTP_CODE_MOVED_PERMANENTLY || httpCode == HTTP_CODE_TEMPORARY_REDIRECT) {
             // Google has already executed doPost() and computed the result by this point;
@@ -882,33 +1055,60 @@ void uploadLatestLogToGoogleDrive(const char* filepath) {
             http.end();
 
             if (redirectUrl.length() > 0) {
-                Serial.println("[Uploader] Following redirect to execution result...");
+                DebugLog.println("[Uploader] Following redirect to execution result...");
                 if (http.begin(client, redirectUrl)) {
                     httpCode = http.GET();
                 } else {
-                    Serial.println("[Uploader] Failed to initialize redirect connection handle.");
+                    DebugLog.println("[Uploader] Failed to initialize redirect connection handle.");
                 }
             } else {
-                Serial.println("[Uploader] Redirect response missing Location header.");
+                DebugLog.println("[Uploader] Redirect response missing Location header.");
             }
         }
 
         if (httpCode > 0) {
             String response = http.getString();
-            Serial.printf("[Uploader] Server response code: %d\n", httpCode);
-            Serial.println("[Uploader] Response: " + response);
+            DebugLog.printf("[Uploader] Server response code: %d\n", httpCode);
+            DebugLog.println("[Uploader] Response: " + response);
 
-            if (response.indexOf("UPLOAD_SUCCESS") != -1) {
-                Serial.println("[Uploader] File successfully archived to Google Drive!");
+            success = response.indexOf("UPLOAD_SUCCESS") != -1;
+            if (success) {
+                DebugLog.println("[Uploader] Chunk archived to Google Drive.");
             }
         } else {
-            Serial.printf("[Uploader] Transport layer failed: %s\n", http.errorToString(httpCode).c_str());
+            DebugLog.printf("[Uploader] Transport layer failed: %s\n", http.errorToString(httpCode).c_str());
         }
         http.end();
     } else {
-        Serial.println("[Uploader] Failed to initialize connection handle.");
-        free(fileBuffer);
+        DebugLog.println("[Uploader] Failed to initialize connection handle.");
     }
+
+    return success;
+}
+
+// Uploads a sequence of already-read chunks, stopping at the first failure
+// rather than skipping ahead (so a partial failure never leaves a gap in the
+// uploaded data — this batch just gets retried from its starting offset next
+// sync, at the cost of possible duplicate rows if some chunks had already
+// landed). batchStartsAtFileBeginning should be true only when this batch's
+// offset is 0 — only then can its first chunk possibly contain a CSV header
+// for uploadOneChunk() to flag. Frees every chunk buffer before returning, on
+// every path. Returns true only if every chunk was uploaded successfully.
+static bool uploadChunksToGoogleDrive(UploadChunk *chunks, int chunkCount, bool batchStartsAtFileBeginning) {
+    bool allOk = (WiFi.status() == WL_CONNECTED);
+    if (!allOk) {
+        DebugLog.println("[Uploader] Error: Wi-Fi disconnected.");
+    }
+
+    for (int i = 0; i < chunkCount; ++i) {
+        if (allOk) {
+            allOk = uploadOneChunk(chunks[i].data, chunks[i].length, batchStartsAtFileBeginning && i == 0);
+        }
+        free(chunks[i].data);
+        chunks[i].data = nullptr;
+    }
+
+    return allOk;
 }
 
 
@@ -929,85 +1129,147 @@ void loop() {
 			zeroCurrentStartTime = millis();
 			trackingZeroCurrent = true;
 			hasScannedThisIdleSession = false;
-			Serial.print("Vehicle Idle...");
+			DebugLog.print("Vehicle Idle...");
 		}
-		
+
 		// If current stays at exactly 0.0A for 15 seconds straight, scan for garage network
 		if (trackingZeroCurrent && (millis() - zeroCurrentStartTime >= 15000) && !hasScannedThisIdleSession) {
-			hasScannedThisIdleSession = true; 
-			
-			Serial.println("\n[Idle Sensor] Vehicle stationary for 15s. Booting up Wi-Fi Radio Hardware...");
-			
-			// 1. Reactivate station mode cleanly without dropping credential buffers
-			WiFi.mode(WIFI_STA);
-			delay(400); 
-			WiFi.disconnect(false); // Soft reset channels only, leaves parameters safe!
-			delay(300); 
+			hasScannedThisIdleSession = true;
 
-			Serial.println("[Idle Sensor] Scanning for Home Wi-Fi...");
+			DebugLog.println("\n[Idle Sensor] Vehicle stationary for 15s.");
 
-			int networkCount = WiFi.scanNetworks();
-			bool foundHome = false;
-			
-			for (int i = 0; i < networkCount; ++i) {
-				if (WiFi.SSID(i) == String(home_ssid)) {
-					foundHome = true;
-					break;
-				}
-			}
-			WiFi.scanDelete(); 
-			
-			if (foundHome) {
-				Serial.println("[Idle Sensor] Home Wi-Fi within range! Resetting network stack...");
-				if (logFile) { logFile.close(); } 
-				
-				// --- FORCE AN ABSOLUTE HARDWARE & STACK REBOOT OF THE RADIO ---
-				WiFi.disconnect(true, true); // True #2 completely clears stored system credentials 
-				WiFi.mode(WIFI_OFF);         // Shut down native stack drivers completely
-				delay(200);                  // Let registers drain completely
-				
-				WiFi.mode(WIFI_STA);         // Spin up a brand new, empty network profile instance
-				delay(200);
-				// ---------------------------------------------------------------
-
-				Serial.println("[Idle Sensor] Connecting to Home Router...");
-				WiFi.begin(home_ssid, home_password);
-				int connectAttempts = 0;
-
-				while (WiFi.status() != WL_CONNECTED && connectAttempts < 20) {
-					delay(500);
-					Serial.print(".");
-					connectAttempts++;
-				}
-				
-				if (WiFi.status() == WL_CONNECTED) {
-					Serial.print("\n[Idle Sensor] Connected to Home Network! IP: ");
-					Serial.println(WiFi.localIP());
-
-					// EXECUTE THE SECURE SYNCHRONIZATION PIPELINE
-					if (currentLogFileName[0] != '\0') {
-						uploadLatestLogToGoogleDrive(currentLogFileName);
-					} else {
-						Serial.println("[Idle Sensor] No log file this session (time never synced); nothing to upload.");
-					}
-					WiFi.disconnect(true);
-					WiFi.mode(WIFI_OFF);
-				} else {
-					Serial.println("\n[Idle Sensor] Home router connection timed out.");
-					WiFi.disconnect(true);
-					WiFi.mode(WIFI_OFF);
-				}
-
+			if (!SD.exists(DATA_FILE_PATH)) {
+				DebugLog.println("[Idle Sensor] No data file this session; nothing to upload.");
 			} else {
-				Serial.println("[Idle Sensor] Home network not spotted. Going dark.");
+				DebugLog.println("[Idle Sensor] Booting up Wi-Fi Radio Hardware...");
+
+				// 1. Reactivate station mode cleanly without dropping credential buffers
+				WiFi.mode(WIFI_STA);
+				delay(400);
+				WiFi.disconnect(false); // Soft reset channels only, leaves parameters safe!
+				delay(300);
+
+				DebugLog.println("[Idle Sensor] Scanning for Home Wi-Fi...");
+
+				int networkCount = WiFi.scanNetworks();
+				bool foundHome = false;
+
+				for (int i = 0; i < networkCount; ++i) {
+					if (WiFi.SSID(i) == String(home_ssid)) {
+						foundHome = true;
+						break;
+					}
+				}
+				WiFi.scanDelete();
+
+				if (!foundHome) {
+					DebugLog.println("[Idle Sensor] Home network not spotted. Going dark.");
+				} else {
+					DebugLog.println("[Idle Sensor] Home Wi-Fi within range! Syncing full backlog, one batch at a time...");
+
+					// Keep looping — read a batch (radio off), connect, upload it,
+					// and if there's still more backlog, go straight into the
+					// next batch — until the whole file is drained or something
+					// stops progress. Deliberately unhurried: as long as the
+					// vehicle stays parked here, blocking CAN reception a while
+					// longer to fully catch up is an acceptable trade for never
+					// losing logged rows to a capped per-visit sync.
+					bool keepGoing = true;
+					int batchNum = 0;
+					const int MAX_BATCHES_PER_SESSION = 500; // safety backstop, not an expected ceiling
+
+					while (keepGoing && batchNum < MAX_BATCHES_PER_SESSION) {
+						batchNum++;
+
+						// Radio off for the SD read — already off from the scan
+						// above on the first batch; a prior batch's upload left
+						// it on, so later batches need to power it down again.
+						WiFi.disconnect(true);
+						WiFi.mode(WIFI_OFF);
+						delay(200);
+
+						if (logFile) { logFile.close(); } // release the handle before the reinit below
+						UploadChunk pendingChunks[MAX_UPLOAD_CHUNKS];
+						size_t syncStartOffset = readSyncOffset();
+						size_t pendingBytesRead = 0;
+						bool pendingReachedEOF = false;
+						int pendingChunkCount = readDataFileToChunks(pendingChunks, MAX_UPLOAD_CHUNKS, syncStartOffset, &pendingBytesRead, &pendingReachedEOF);
+
+						if (pendingChunkCount < 0) {
+							DebugLog.println("[Idle Sensor] Read failed; will resume this backlog next sync.");
+							break;
+						}
+						if (pendingChunkCount == 0) {
+							// Nothing left to read — already fully synced (e.g. a
+							// prior session finished but cleanup didn't run).
+							if (pendingReachedEOF) {
+								SD.remove(DATA_FILE_PATH);
+								clearSyncOffset();
+								DebugLog.println("[Idle Sensor] Data file was already fully synced; cleared.");
+							}
+							break;
+						}
+
+						// --- FORCE AN ABSOLUTE HARDWARE & STACK REBOOT OF THE RADIO ---
+						WiFi.disconnect(true, true); // True #2 completely clears stored system credentials
+						WiFi.mode(WIFI_OFF);         // Shut down native stack drivers completely
+						delay(200);                  // Let registers drain completely
+
+						WiFi.mode(WIFI_STA);         // Spin up a brand new, empty network profile instance
+						delay(200);
+						// ---------------------------------------------------------------
+
+						DebugLog.printf("[Idle Sensor] Connecting to Home Router for batch %d...\n", batchNum);
+						WiFi.begin(home_ssid, home_password);
+						int connectAttempts = 0;
+
+						while (WiFi.status() != WL_CONNECTED && connectAttempts < 20) {
+							delay(500);
+							DebugLog.print(".");
+							connectAttempts++;
+						}
+
+						if (WiFi.status() != WL_CONNECTED) {
+							DebugLog.println("\n[Idle Sensor] Lost the home connection mid-sync; will resume this backlog next sync.");
+							for (int i = 0; i < pendingChunkCount; ++i) {
+								if (pendingChunks[i].data) free(pendingChunks[i].data);
+							}
+							break;
+						}
+						DebugLog.print("\n[Idle Sensor] Connected! IP: ");
+						DebugLog.println(WiFi.localIP());
+
+						// EXECUTE THE SECURE SYNCHRONIZATION PIPELINE — pure network
+						// I/O from here, the batch was already read into RAM above.
+						bool uploadSucceeded = uploadChunksToGoogleDrive(pendingChunks, pendingChunkCount, syncStartOffset == 0); // frees chunks internally
+
+						if (!uploadSucceeded) {
+							DebugLog.println("[Idle Sensor] Upload failed; will resume this backlog next sync.");
+							break;
+						}
+
+						size_t newOffset = syncStartOffset + pendingBytesRead;
+						if (pendingReachedEOF) {
+							SD.remove(DATA_FILE_PATH); // fully synced — next row logged starts a fresh file
+							clearSyncOffset();
+							DebugLog.println("[Idle Sensor] Data file fully synced and cleared.");
+							keepGoing = false;
+						} else {
+							writeSyncOffset(newOffset);
+							DebugLog.printf("[Idle Sensor] Synced %u bytes so far this visit; more remains, continuing...\n", (unsigned)newOffset);
+							// keepGoing stays true — loop straight into the next batch.
+						}
+					}
+				}
+
 				WiFi.disconnect(true);
-				WiFi.mode(WIFI_OFF); 
+				WiFi.mode(WIFI_OFF);
 			}
 		}
 	} else {
 		// Vehicle is drawing power or regen-braking! Reset tracking states instantly
 		if (trackingZeroCurrent && !hasScannedThisIdleSession) {
-			Serial.println(); // close off the "Vehicle Idle..." dot line
+			DebugLog.println(); // close off the "Vehicle Idle..." dot line
 		}
 		trackingZeroCurrent = false;
 		if (hasScannedThisIdleSession) {
