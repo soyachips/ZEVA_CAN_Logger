@@ -429,7 +429,7 @@ private:
 
 static TeeLogger DebugLog;
 
-static void writeLogHeader(File &file);
+static void writeLogHeader(File &file, int totalCellCount);
 
 static size_t readSyncOffset() {
 	if (!SD.exists(SYNC_OFFSET_PATH)) return 0; // avoids a noisy vfs_api.cpp error for the common no-offset-yet case
@@ -458,7 +458,18 @@ static void clearSyncOffset() {
 	if (SD.exists(SYNC_OFFSET_PATH)) SD.remove(SYNC_OFFSET_PATH);
 }
 
-static bool openDataFile() {
+// True for the rest of this boot after setup() eagerly creates a brand-new
+// /data.csv with a placeholder-width header (MAX_TOTAL_CELL_COUNT, so the
+// file exists immediately for bench testing without real CAN data) — cleared
+// once the first real CAN row rewrites that header to the true cell count
+// (see trimDataFileHeaderIfNeeded()). Never set when resuming an existing
+// file, since its header (from whenever it was first created) is already
+// meaningful and shouldn't be touched again.
+static bool dataFileNeedsHeaderTrim = false;
+
+// totalCellCount only matters if this call ends up creating a brand-new
+// file — it becomes the header's cell1..cellN width.
+static bool openDataFile(int totalCellCount) {
 	if (!sdInitialized) return false;
 	if (logFile) return true; // already open
 
@@ -470,10 +481,29 @@ static bool openDataFile() {
 	}
 
 	if (isNewFile) {
-		writeLogHeader(logFile);
+		writeLogHeader(logFile, totalCellCount);
 		clearSyncOffset(); // a leftover offset can't apply to this new file
 	}
 	return true;
+}
+
+// Called once the real cell count is known (the first CAN row of this
+// boot). If setup() created /data.csv fresh with the MAX_TOTAL_CELL_COUNT
+// placeholder header, that file so far contains nothing but that one header
+// line (data rows only start once real CAN current is flowing) — safe to
+// discard and recreate with the header it should have had all along.
+static void trimDataFileHeaderIfNeeded(int totalCellCount) {
+	if (!dataFileNeedsHeaderTrim) return;
+	dataFileNeedsHeaderTrim = false;
+	if (logFile) logFile.close();
+	SD.remove(DATA_FILE_PATH);
+	logFile = SD.open(DATA_FILE_PATH, FILE_APPEND);
+	if (logFile) {
+		writeLogHeader(logFile, totalCellCount);
+	}
+	// If this reopen failed for some reason, logFile is left invalid and the
+	// normal openDataFile() call right after this naturally recreates the
+	// file (correctly, since it no longer exists) instead of getting stuck.
 }
 
 static uint8_t countUsedModuleCells(const BmsModuleState &state) {
@@ -488,6 +518,8 @@ static uint8_t countUsedModuleCells(const BmsModuleState &state) {
 	return count;
 }
 
+// Placeholder header width used only for the eager boot-time file creation
+// (see setup()) — trimmed down to the real cell count on the first CAN row.
 static const int MAX_TOTAL_CELL_COUNT = MAX_BMS_MODULES * 12;
 
 static uint8_t getModuleCellCount(uint8_t moduleId) {
@@ -512,9 +544,9 @@ static void clearReadyModules() {
 	for (int i = 0; i < MAX_BMS_MODULES; ++i) moduleReady[i] = false;
 }
 
-static void writeLogHeader(File &file) {
+static void writeLogHeader(File &file, int totalCellCount) {
 	file.print("timestamp,packV,packI");
-	for (int i = 1; i <= MAX_TOTAL_CELL_COUNT; ++i) {
+	for (int i = 1; i <= totalCellCount; ++i) {
 		file.print(",cell");
 		file.print(i);
 	}
@@ -533,10 +565,12 @@ void printPackVoltages(uint32_t timestamp) {
 	appendPackVoltageValue(buffer, sizeof(buffer), len, packVoltage);
 	appendPackCurrentValue(buffer, sizeof(buffer), len, packCurrent);
 
+	int totalCellCount = 0;
 	for (int m = 0; m < MAX_BMS_MODULES; ++m) {
 		uint8_t used = getModuleCellCount(m);
 		for (int c = 0; c < used; ++c) {
 			appendCellVoltageValue(buffer, sizeof(buffer), len, bmsModules[m].volts[c]);
+			totalCellCount++;
 		}
 	}
 
@@ -546,7 +580,8 @@ void printPackVoltages(uint32_t timestamp) {
 	// ONLY write to the SD card if the clock is synced (timestamps are wall-clock
 	// based) and current is outside the idle deadband (charging or discharging)
 	if (sdInitialized && timeSynced && !isPackIdle()) {
-		if (openDataFile()) {
+		trimDataFileHeaderIfNeeded(totalCellCount);
+		if (openDataFile(totalCellCount)) {
 			logFile.println(buffer);
 			logFile.flush(); // Safely saves data to the flash sector
 		} else {
@@ -730,10 +765,20 @@ void setup() {
 	}
 
 	// SD card is already mounted (see top of setup()); now that the clock
-	// situation is known, open (or resume appending to) the data file if synced.
+	// situation is known, open (or resume appending to) the data file if
+	// synced — eagerly, with a placeholder-width header, so the file exists
+	// immediately (useful for bench testing without real CAN data). The
+	// header gets trimmed to the real cell count on the first CAN row
+	// actually logged (see trimDataFileHeaderIfNeeded()) — only when this
+	// call is the one creating the file fresh, not when resuming an
+	// existing one that already has a meaningful header.
 	if (sdInitialized) {
 		if (timeSynced) {
-			if (openDataFile()) {
+			bool wasNewFile = !SD.exists(DATA_FILE_PATH);
+			if (openDataFile(MAX_TOTAL_CELL_COUNT)) {
+				if (wasNewFile) {
+					dataFileNeedsHeaderTrim = true;
+				}
 				DebugLog.printf("Logging enabled: %s\n", DATA_FILE_PATH);
 				logFile.flush();
 			} else {
