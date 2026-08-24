@@ -305,41 +305,31 @@ static SPIClass sdSpi(VSPI);
 static File logFile;
 static char currentLogFileName[32] = "";
 static bool sdInitialized = false;
+// Only true once NTP has synced this boot; gates whether we write rows to SD
+// at all, since log timestamps are wall-clock based and meaningless without it.
+static bool timeSynced = false;
 
 static void writeLogHeader(File &file);
 
 static void getCurrentLogDate(char *dateString, size_t size) {
+	// Only ever called once timeSynced is true, so the clock is always valid here.
 	time_t now = time(nullptr);
-	if (now < 24 * 3600) {
-		strncpy(dateString, "unknown", size);
-		dateString[size - 1] = '\0';
-		return;
-	}
 	struct tm timeinfo;
 	localtime_r(&now, &timeinfo);
 	strftime(dateString, size, "%Y%m%d", &timeinfo);
 }
 
-// Resolves to the same filename for the whole boot session: once a date is
-// known (or known to be unavailable) that doesn't change until reboot, and
-// callers rely on getting back the exact same name every time they ask.
+// Resolves to the same filename for the whole boot session: once resolved it
+// doesn't change until reboot, and callers rely on getting back the exact
+// same name every time they ask.
 static void getLogFileName(char *filename, size_t size) {
 	static char resolvedName[32] = "";
 
 	if (resolvedName[0] == '\0') {
 		char dateString[16];
 		getCurrentLogDate(dateString, sizeof(dateString));
-		if (strcmp(dateString, "unknown") == 0) {
-			// No date available: pick a session-numbered name so multiple
-			// undated boots on the same card don't merge into one file.
-			int sessionCounter = 1;
-			do {
-				snprintf(resolvedName, sizeof(resolvedName), "/log-session-%02d.csv", sessionCounter++);
-			} while (SD.exists(resolvedName));
-		} else {
-			// One file per calendar day; purgeOldLogFiles() rotates these out.
-			snprintf(resolvedName, sizeof(resolvedName), "/log-%s.csv", dateString);
-		}
+		// One file per calendar day; purgeOldLogFiles() rotates these out.
+		snprintf(resolvedName, sizeof(resolvedName), "/log-%s.csv", dateString);
 	}
 
 	strncpy(filename, resolvedName, size);
@@ -472,8 +462,14 @@ static void writeLogHeader(File &file) {
 }
 
 void printPackVoltages(uint32_t timestamp) {
+	time_t rawTime = (time_t)timestamp;
+	struct tm timeinfo;
+	localtime_r(&rawTime, &timeinfo);
+	char timeStr[24];
+	strftime(timeStr, sizeof(timeStr), "%Y-%m-%d %H:%M:%S", &timeinfo);
+
 	char buffer[2048];
-	int len = snprintf(buffer, sizeof(buffer), "%lu", timestamp);
+	int len = snprintf(buffer, sizeof(buffer), "%s", timeStr);
 	appendPackVoltageValue(buffer, sizeof(buffer), len, packVoltage);
 	appendPackCurrentValue(buffer, sizeof(buffer), len, packCurrent);
 
@@ -487,8 +483,9 @@ void printPackVoltages(uint32_t timestamp) {
 	// Always output to the Serial Terminal for instant debugging
 	Serial.println(buffer);
 
-	// ONLY write to the SD card if current is outside the idle deadband (charging or discharging)
-	if (sdInitialized && !isPackIdle()) {
+	// ONLY write to the SD card if the clock is synced (timestamps are wall-clock
+	// based) and current is outside the idle deadband (charging or discharging)
+	if (sdInitialized && timeSynced && !isPackIdle()) {
 		if (openLogFile()) {
 			logFile.println(buffer);
 			logFile.flush(); // Safely saves data to the flash sector
@@ -537,7 +534,6 @@ void setup() {
 	delay(1000);
 
 	WiFi.mode(WIFI_STA);
-	bool timeSynced = false;
 
 	// 0. If we're already in range of home Wi-Fi (e.g. starting the ride from
 	// home), connect briefly just to sync the clock before the log file for
@@ -656,11 +652,15 @@ void setup() {
 		Serial.println("SD initialized.");
 		purgeOldLogFiles();
 
-		if (openLogFile()) {
-			Serial.printf("Logging enabled: %s\n", currentLogFileName);
-			logFile.flush();
+		if (timeSynced) {
+			if (openLogFile()) {
+				Serial.printf("Logging enabled: %s\n", currentLogFileName);
+				logFile.flush();
+			} else {
+				Serial.println("Failed to open log file for writing.");
+			}
 		} else {
-			Serial.println("Failed to open log file for writing.");
+			Serial.println("Time not synced this boot; SD logging disabled for this session.");
 		}
 	}
 
@@ -709,7 +709,7 @@ void processBmsMessage(uint32_t packetId, const uint8_t data[8], size_t length) 
 	if (state.seen[0] && state.seen[1] && state.seen[2] && state.seen[3]) {
 		moduleReady[moduleId] = true;
 		if (readyPackIsContiguous()) {
-			printPackVoltages(millis());
+			printPackVoltages((uint32_t)time(nullptr));
 			clearReadyModules();
 		}
 	}
@@ -746,8 +746,6 @@ void processBmsMessage(uint32_t packetId, const uint8_t data[8], size_t length) 
 			break;
 	}
 }
-
-#include <HTTPClient.h>
 
 #include <HTTPClient.h>
 #include <WiFiClientSecure.h>
@@ -797,33 +795,59 @@ void uploadLatestLogToGoogleDrive(const char* filepath) {
         correctPath = "/" + correctPath;
     }
 
-    File fileToStream = SD.open(correctPath.c_str(), FILE_READ);
-    if (!fileToStream) {
-        Serial.printf("[Uploader] Failed to read log file target path: %s\n", correctPath.c_str());
-        return;
-    }
+    // Read the whole file into RAM before touching Wi-Fi endpoints. Even with
+    // WiFi already connected (not mid-transmit), the SD bus can still glitch
+    // mid-read and leave the card unresponsive to subsequent commands — a
+    // plain reopen won't recover from that, so retry with a full SD reinit
+    // between attempts before giving up on this sync.
+    const int MAX_READ_ATTEMPTS = 3;
+    uint8_t *fileBuffer = nullptr;
+    size_t fileSize = 0;
+    bool readOk = false;
 
-    size_t fileSize = fileToStream.size();
-    Serial.printf("[Uploader] Initiating upload for file: %s (%d bytes)\n", correctPath.c_str(), fileSize);
+    for (int attempt = 1; attempt <= MAX_READ_ATTEMPTS && !readOk; ++attempt) {
+        if (attempt > 1) {
+            Serial.printf("[Uploader] Retrying SD read (attempt %d/%d)...\n", attempt, MAX_READ_ATTEMPTS);
+            SD.end();
+            delay(200);
+            if (!SD.begin(SD_CS_PIN, sdSpi)) {
+                Serial.println("[Uploader] SD reinit failed during retry.");
+                continue;
+            }
+        }
 
-    // Read the whole file into RAM before touching Wi-Fi at all. Streaming it
-    // straight off the SD card while the radio is transmitting has been
-    // observed to disrupt SD SPI timing badly enough to fail the read mid-transfer.
-    uint8_t *fileBuffer = (uint8_t *)malloc(fileSize);
-    if (!fileBuffer) {
-        Serial.println("[Uploader] Failed to allocate upload buffer.");
+        File fileToStream = SD.open(correctPath.c_str(), FILE_READ);
+        if (!fileToStream) {
+            Serial.printf("[Uploader] Failed to open log file target path: %s\n", correctPath.c_str());
+            continue;
+        }
+
+        fileSize = fileToStream.size();
+        uint8_t *buffer = (uint8_t *)malloc(fileSize);
+        if (!buffer) {
+            Serial.println("[Uploader] Failed to allocate upload buffer.");
+            fileToStream.close();
+            return; // won't improve on retry
+        }
+
+        size_t bytesRead = fileToStream.read(buffer, fileSize);
         fileToStream.close();
+
+        if (bytesRead == fileSize) {
+            fileBuffer = buffer;
+            readOk = true;
+        } else {
+            Serial.println("[Uploader] Failed to read complete file from SD card.");
+            free(buffer);
+        }
+    }
+
+    if (!readOk) {
+        Serial.println("[Uploader] Giving up after repeated SD read failures.");
         return;
     }
 
-    size_t bytesRead = fileToStream.read(fileBuffer, fileSize);
-    fileToStream.close();
-
-    if (bytesRead != fileSize) {
-        Serial.println("[Uploader] Failed to read complete file from SD card.");
-        free(fileBuffer);
-        return;
-    }
+    Serial.printf("[Uploader] Initiating upload for file: %s (%d bytes)\n", correctPath.c_str(), fileSize);
 
     // Extract a clean name without the leading slash for the query parameter
     String cleanName = correctPath;
@@ -961,7 +985,11 @@ void loop() {
 					Serial.println(WiFi.localIP());
 
 					// EXECUTE THE SECURE SYNCHRONIZATION PIPELINE
-					uploadLatestLogToGoogleDrive(currentLogFileName);
+					if (currentLogFileName[0] != '\0') {
+						uploadLatestLogToGoogleDrive(currentLogFileName);
+					} else {
+						Serial.println("[Idle Sensor] No log file this session (time never synced); nothing to upload.");
+					}
 					WiFi.disconnect(true);
 					WiFi.mode(WIFI_OFF);
 				} else {
