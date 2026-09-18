@@ -8,7 +8,7 @@ An ESP32-based logger for ZEVA BMS CAN data. It listens for ZEVA BMS packets on 
 - merges module data into a single contiguous pack row per print/log cycle
 - logs to a single local SD file (`/data.csv`), only while the clock has been NTP-synced this boot and pack current is non-zero (charging or discharging) — idle rows and rows from unsynced sessions are still printed to Serial but not written to SD
 - the local file is deleted only once its contents are *fully* synced to Drive, so the next row logged starts a fresh file — a backlog too big to sync in one pass instead makes incremental progress via a persistent byte offset — see [Idle-triggered Drive sync](#idle-triggered-drive-sync)
-- serves a live WiFi dashboard (voltage/current + per-cell trend charts) when connected to a hotspot, plus firmware OTA updates at `/update` via ElegantOTA
+- serves a live WiFi dashboard (voltage/current + per-cell trend charts) when connected to a hotspot, plus firmware OTA updates at `/update` via ElegantOTA — see [Flashing firmware over WiFi (OTA)](#flashing-firmware-over-wifi-ota)
 - automatically detects when the vehicle has been idle (current within a small deadband of 0 A) for 15 seconds, and if a known home WiFi network is in range, syncs the entire not-yet-synced backlog to a persistent file on Google Drive — one bounded batch at a time (read into RAM with WiFi off, then WiFi on to upload), looping through batches until fully caught up rather than syncing only a capped amount per visit — see [Idle-triggered Drive sync](#idle-triggered-drive-sync)
 - can optionally mirror boot/connectivity/upload events (not raw telemetry) to a single evergreen `/log.txt` debug file on SD with per-line timestamps, so a run can be diagnosed without a serial monitor attached — off by default, see [Debug/event log](#debugevent-log-logtxt)
 
@@ -66,6 +66,17 @@ Note: the Drive file just keeps growing across every successful sync (there's no
 3. Initialize CAN and the SD card either way. If the clock was synced (from either network), open (or resume appending to) `/data.csv`. A brand-new file gets a placeholder-width header (`cell1..cell192`, covering the maximum possible module/cell configuration) so the file exists immediately — useful for bench testing without a live CAN bus — and that header is rewritten to the real cell count the moment the first actual CAN row is logged (see CSV data file format).
 
 If neither network is in range, the ESP32's clock is never set for that boot session, and SD logging is skipped entirely — CAN data still prints to Serial for live viewing, but nothing is written to the card, since row timestamps are wall-clock based and would be meaningless without a synced clock. This also means a session with no clock sync has no data file to upload later, so the idle-triggered Drive sync becomes a no-op for that boot.
+
+## Flashing firmware over WiFi (OTA)
+No USB cable needed once the board is on the hotspot. PlatformIO doesn't push anything anywhere by itself — it only builds the `.bin` file; you upload that file manually through ElegantOTA's web page.
+
+1. **Get the ESP32 onto the hotspot.** Power it on within range of `SECRET_HOTSPOT_SSID` (see Setup). It only opens the OTA server during its boot-time hotspot connection attempt, so it has to already be connected — if it boots out of range and falls into offline mode, power-cycle it in range to get another shot.
+2. **Connect your computer to that same hotspot.** `/update` is only reachable from a device on the same network.
+3. **Build (don't flash) the new firmware**: `pio run -e esp32dev`. This produces `.pio/build/esp32dev/firmware.bin` on your computer — it does not touch the ESP32.
+4. **Open `http://172.20.10.9/update`** in a browser (adjust the IP if you changed `local_IP` in `src/main.cpp` — see Setup).
+5. Choose `firmware.bin` on that page and upload it. The board flashes and reboots into the new firmware automatically.
+
+**From a phone instead of a laptop**: upload `firmware.bin` to Google Drive from your computer, then on your phone download it from the Drive app to local storage (not just preview it — the browser's upload picker needs an actual file, e.g. in the Files app / Downloads). With the phone providing the hotspot (and the ESP32 already connected to it), open `http://172.20.10.9/update` in the phone's browser and upload the downloaded file the same way.
 
 ## Idle-triggered Drive sync
 Once pack current has read within `CURRENT_IDLE_THRESHOLD_MA` of zero (a deadband, not an exact-zero check — current sensors have noise/offset and rarely read exactly 0 at rest) for 15 straight seconds, and the home WiFi network is actually in range, the logger loops through batches until the whole backlog is drained (or something stops progress):
