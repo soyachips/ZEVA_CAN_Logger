@@ -1,6 +1,5 @@
 #include <Arduino.h>
-#include <SPI.h>
-#include <SD.h>
+#include <LittleFS.h>
 #include <driver/twai.h>
 #include <time.h>
 
@@ -25,9 +24,8 @@ const int   daylightOffset_sec = 3600;     // 1 hour daylight savings shift
 static const int NTP_SYNC_MAX_ATTEMPTS = 3;
 static const uint32_t NTP_SYNC_TIMEOUT_MS = 4000; // 1000ms was too short for a real DNS lookup + UDP round trip
 // WiFi is busiest right after association (DHCP, ARP) in its own background
-// task, independent of our sequential code — a brief pause here before any
-// SD activity reduces (doesn't guarantee zero) the odds of an SD/WiFi
-// electrical collision on marginal wiring/power.
+// task, independent of our sequential code — a brief pause lets DHCP finish
+// before NTP and other network traffic starts.
 static const uint32_t WIFI_SETTLE_DELAY_MS = 500;
 
 // --- PROXIMITY ENGINE TRACKING VARIABLES ---
@@ -247,8 +245,8 @@ IPAddress primaryDNS(172, 20, 10, 1);  // Use your phone for DNS requests
 // Global definition of your web server
 WebServer server(80);
 
-static const gpio_num_t CAN_TX_PIN = GPIO_NUM_21;
-static const gpio_num_t CAN_RX_PIN = GPIO_NUM_22;
+static const gpio_num_t CAN_TX_PIN = GPIO_NUM_12;
+static const gpio_num_t CAN_RX_PIN = GPIO_NUM_14;
 static const uint32_t CAN_SPEED = 250000;
 static const uint32_t BMS_BASE_ID = 300;
 static const uint8_t MAX_BMS_MODULES = 16;
@@ -303,11 +301,8 @@ static void appendCellVoltageValue(char *buffer, size_t size, int &len, uint16_t
 	len += snprintf(buffer + len, size - len, ",%d.%03d", whole, frac);
 }
 
-static const int SD_CS_PIN = 27;
-static const int SD_MISO_PIN = 19;
-static const int SD_MOSI_PIN = 23;
-static const int SD_SCK_PIN = 18;
-static SPIClass sdSpi(VSPI);
+// Logs live in a LittleFS partition on the module's internal flash (see
+// partitions.csv) — this board has no SD card.
 static File logFile;
 // A single generic data file rather than one per day: the backend now
 // appends every sync onto one persistent Drive file regardless of when the
@@ -324,29 +319,33 @@ static const char *DATA_FILE_PATH = "/data.csv";
 // brand-new data file is created (see openDataFile()) since a stale offset
 // from a previous file's lifetime can't apply to a new one.
 static const char *SYNC_OFFSET_PATH = "/data.offset";
-static bool sdInitialized = false;
-// Only true once NTP has synced this boot; gates whether we write rows to SD
+static bool fsMounted = false;
+// Free space kept in reserve: LittleFS needs a few spare blocks for its own
+// copy-on-write metadata, and running it completely full risks failed writes
+// leaving a half-written row at the end of the CSV.
+static const size_t STORAGE_RESERVE_BYTES = 32 * 1024;
+// Checking free space walks the filesystem, so it's re-checked at most this often.
+static const uint32_t STORAGE_CHECK_INTERVAL_MS = 10000;
+// Only true once NTP has synced this boot; gates whether we write rows to flash
 // at all, since log timestamps are wall-clock based and meaningless without it.
 static bool timeSynced = false;
 
 // --- DEBUG/EVENT LOG ---
 // A single evergreen text file that mirrors boot/connectivity/upload events
-// (not raw telemetry) to SD with a timestamp on each line, so a run can be
+// (not raw telemetry) to flash with a timestamp on each line, so a run can be
 // inspected afterward with no serial monitor attached (e.g. battery testing).
-// Disabled for now: SD writes during active WiFi (search/connect/NTP) were
-// triggering sdCommand() failures on this hardware, and the CSV data logging
-// ran fine on its own without this extra SD traffic. Flip back to true to
-// re-enable once the underlying SD/WiFi issue is resolved (e.g. decoupling
-// capacitor added) — nothing else needs to change, DebugLog just falls
-// through to Serial-only while this is off.
+// Off by default: it shares the same flash as the CSV log and is never synced
+// or cleared, so it would slowly eat into logging space. Flip to true to
+// enable — nothing else needs to change, DebugLog just falls through to
+// Serial-only while this is off.
 static const bool DEBUG_LOG_ENABLED = false;
 static const char *DEBUG_LOG_PATH = "/log.txt";
 static File debugFile;
 
 static bool openDebugLogFile() {
-	if (!DEBUG_LOG_ENABLED || !sdInitialized) return false;
+	if (!DEBUG_LOG_ENABLED || !fsMounted) return false;
 	if (debugFile) debugFile.close();
-	debugFile = SD.open(DEBUG_LOG_PATH, FILE_APPEND);
+	debugFile = LittleFS.open(DEBUG_LOG_PATH, FILE_APPEND);
 	return (bool)debugFile;
 }
 
@@ -367,11 +366,10 @@ static void formatDebugTimestamp(char *buf, size_t size) {
 }
 
 // Mirrors Print output to both the real Serial port and the debug log file.
-// Writes go to SD immediately (nothing sits buffered in RAM waiting for a
+// Writes go to the file immediately (nothing sits buffered in RAM waiting for a
 // future newline), but flushing is rate-limited: a WiFi search/connect loop
-// calls print(".") up to ~20 times over 10s, and forcing a physical SD flush
-// on every single one of those hammers the card during WiFi's busiest window
-// (association, DHCP) — observed to trigger SD errors on marginal wiring. So
+// calls print(".") up to ~20 times over 10s, and forcing a physical flash
+// write on every single one of those adds needless flash wear. So
 // we always flush when a line starts (a crash still records that something
 // began) and when a line completes, but a run of dots in between only forces
 // a flush if it's been a while, as a safety net for a genuine stall.
@@ -432,8 +430,8 @@ static TeeLogger DebugLog;
 static void writeLogHeader(File &file, int totalCellCount);
 
 static size_t readSyncOffset() {
-	if (!SD.exists(SYNC_OFFSET_PATH)) return 0; // avoids a noisy vfs_api.cpp error for the common no-offset-yet case
-	File f = SD.open(SYNC_OFFSET_PATH, FILE_READ);
+	if (!LittleFS.exists(SYNC_OFFSET_PATH)) return 0; // avoids a noisy vfs_api.cpp error for the common no-offset-yet case
+	File f = LittleFS.open(SYNC_OFFSET_PATH, FILE_READ);
 	if (!f) return 0;
 	char buf[16] = {0};
 	size_t n = f.read((uint8_t *)buf, sizeof(buf) - 1);
@@ -447,15 +445,38 @@ static size_t readSyncOffset() {
 // FILE_WRITE doesn't truncate, so a shorter new value (e.g. "512" replacing
 // "268729") would otherwise leave trailing digits from the old one behind.
 static void writeSyncOffset(size_t offset) {
-	if (SD.exists(SYNC_OFFSET_PATH)) SD.remove(SYNC_OFFSET_PATH);
-	File f = SD.open(SYNC_OFFSET_PATH, FILE_WRITE);
+	if (LittleFS.exists(SYNC_OFFSET_PATH)) LittleFS.remove(SYNC_OFFSET_PATH);
+	File f = LittleFS.open(SYNC_OFFSET_PATH, FILE_WRITE);
 	if (!f) return;
 	f.print(offset);
 	f.close();
 }
 
 static void clearSyncOffset() {
-	if (SD.exists(SYNC_OFFSET_PATH)) SD.remove(SYNC_OFFSET_PATH);
+	if (LittleFS.exists(SYNC_OFFSET_PATH)) LittleFS.remove(SYNC_OFFSET_PATH);
+}
+
+// True if there's room for another row. When storage fills up, logging simply
+// pauses (rows still go to Serial) until a home sync clears the data file.
+static bool storageHasRoom() {
+	static bool checkedOnce = false;
+	static uint32_t lastCheckMs = 0;
+	static bool hasRoom = true;
+	static bool warnedFull = false;
+	if (checkedOnce && millis() - lastCheckMs < STORAGE_CHECK_INTERVAL_MS) return hasRoom;
+	checkedOnce = true;
+	lastCheckMs = millis();
+
+	size_t total = LittleFS.totalBytes();
+	size_t used = LittleFS.usedBytes();
+	hasRoom = used + STORAGE_RESERVE_BYTES < total;
+	if (!hasRoom && !warnedFull) {
+		DebugLog.printf("Storage full (%u of %u bytes used); logging paused until next sync.\n", (unsigned)used, (unsigned)total);
+		warnedFull = true;
+	} else if (hasRoom) {
+		warnedFull = false;
+	}
+	return hasRoom;
 }
 
 // True for the rest of this boot after setup() eagerly creates a brand-new
@@ -470,12 +491,12 @@ static bool dataFileNeedsHeaderTrim = false;
 // totalCellCount only matters if this call ends up creating a brand-new
 // file — it becomes the header's cell1..cellN width.
 static bool openDataFile(int totalCellCount) {
-	if (!sdInitialized) return false;
+	if (!fsMounted) return false;
 	if (logFile) return true; // already open
 
-	bool isNewFile = !SD.exists(DATA_FILE_PATH);
+	bool isNewFile = !LittleFS.exists(DATA_FILE_PATH);
 
-	logFile = SD.open(DATA_FILE_PATH, FILE_APPEND);
+	logFile = LittleFS.open(DATA_FILE_PATH, FILE_APPEND);
 	if (!logFile) {
 		return false;
 	}
@@ -496,8 +517,8 @@ static void trimDataFileHeaderIfNeeded(int totalCellCount) {
 	if (!dataFileNeedsHeaderTrim) return;
 	dataFileNeedsHeaderTrim = false;
 	if (logFile) logFile.close();
-	SD.remove(DATA_FILE_PATH);
-	logFile = SD.open(DATA_FILE_PATH, FILE_APPEND);
+	LittleFS.remove(DATA_FILE_PATH);
+	logFile = LittleFS.open(DATA_FILE_PATH, FILE_APPEND);
 	if (logFile) {
 		writeLogHeader(logFile, totalCellCount);
 	}
@@ -577,9 +598,9 @@ void printPackVoltages(uint32_t timestamp) {
 	// Always output to the Serial Terminal for instant debugging
 	Serial.println(buffer);
 
-	// ONLY write to the SD card if the clock is synced (timestamps are wall-clock
+	// ONLY write to flash if the clock is synced (timestamps are wall-clock
 	// based) and current is outside the idle deadband (charging or discharging)
-	if (sdInitialized && timeSynced && !isPackIdle()) {
+	if (fsMounted && timeSynced && !isPackIdle() && storageHasRoom()) {
 		trimDataFileHeaderIfNeeded(totalCellCount);
 		if (openDataFile(totalCellCount)) {
 			logFile.println(buffer);
@@ -636,19 +657,15 @@ void setup() {
 	Serial.begin(115200);
 	delay(1000);
 
-	// Bring up the SD card and the debug log first, before any WiFi activity,
+	// Mount flash storage and the debug log first, before any WiFi activity,
 	// so the boot/connectivity sequence below gets captured to /log.txt even
-	// with no serial monitor attached.
-	pinMode(SD_CS_PIN, OUTPUT);
-	digitalWrite(SD_CS_PIN, HIGH);
-	delay(10);
-	sdSpi.begin(SD_SCK_PIN, SD_MISO_PIN, SD_MOSI_PIN, SD_CS_PIN);
-
-	if (!SD.begin(SD_CS_PIN, sdSpi)) {
-		Serial.println("SD initialization failed. Check SD card wiring.");
+	// with no serial monitor attached. formatOnFail=true: a fresh board's
+	// partition is blank and needs formatting on first boot.
+	if (!LittleFS.begin(true)) {
+		Serial.println("Flash filesystem mount failed. Check the partition table includes a 'spiffs' data partition.");
 	} else {
-		sdInitialized = true;
-		Serial.println("SD initialized.");
+		fsMounted = true;
+		Serial.printf("Flash filesystem mounted (%u of %u bytes used).\n", (unsigned)LittleFS.usedBytes(), (unsigned)LittleFS.totalBytes());
 		if (!openDebugLogFile()) {
 			if (DEBUG_LOG_ENABLED) {
 				Serial.println("Failed to open debug log file; continuing with Serial only.");
@@ -675,7 +692,7 @@ void setup() {
 
 	if (WiFi.status() == WL_CONNECTED) {
 		DebugLog.println("\nHome Wi-Fi found.");
-		delay(WIFI_SETTLE_DELAY_MS); // let association/DHCP traffic settle before more SD activity
+		delay(WIFI_SETTLE_DELAY_MS); // let association/DHCP traffic settle
 		timeSynced = syncTimeFromNTP();
 		WiFi.disconnect();
 		delay(200);
@@ -705,7 +722,7 @@ void setup() {
 	// BRANCH A: ONLINE MODE (Hotspot Found!)
 	if (wifiConnected) {
 		DebugLog.println("\nConnected successfully!!! Network node established.");
-		delay(WIFI_SETTLE_DELAY_MS); // let association/DHCP traffic settle before more SD activity
+		delay(WIFI_SETTLE_DELAY_MS); // let association/DHCP traffic settle
 		DebugLog.print("IP Address: ");
 		DebugLog.println(WiFi.localIP());
 
@@ -764,7 +781,7 @@ void setup() {
 		DebugLog.println("CAN initialization failed. Check CAN wiring and transceiver.");
 	}
 
-	// SD card is already mounted (see top of setup()); now that the clock
+	// Flash storage is already mounted (see top of setup()); now that the clock
 	// situation is known, open (or resume appending to) the data file if
 	// synced — eagerly, with a placeholder-width header, so the file exists
 	// immediately (useful for bench testing without real CAN data). The
@@ -772,9 +789,9 @@ void setup() {
 	// actually logged (see trimDataFileHeaderIfNeeded()) — only when this
 	// call is the one creating the file fresh, not when resuming an
 	// existing one that already has a meaningful header.
-	if (sdInitialized) {
+	if (fsMounted) {
 		if (timeSynced) {
-			bool wasNewFile = !SD.exists(DATA_FILE_PATH);
+			bool wasNewFile = !LittleFS.exists(DATA_FILE_PATH);
 			if (openDataFile(MAX_TOTAL_CELL_COUNT)) {
 				if (wasNewFile) {
 					dataFileNeedsHeaderTrim = true;
@@ -785,7 +802,7 @@ void setup() {
 				DebugLog.println("Failed to open data file for writing.");
 			}
 		} else {
-			DebugLog.println("Time not synced this boot; SD logging disabled for this session.");
+			DebugLog.println("Time not synced this boot; logging disabled for this session.");
 		}
 	}
 
@@ -941,14 +958,14 @@ static uint8_t *mallocChunkAdaptive(size_t desired, size_t *outSize) {
 //
 // Returns the chunk count (>= 0, possibly 0 at genuine EOF) on any run that
 // made progress or found nothing left to do. Only returns -1 — a real
-// failure worth retrying via readDataFileToChunks()'s SD reinit — for an
+// failure worth retrying via readDataFileToChunks() — for an
 // actual I/O problem (open/seek/short-read), or hitting the memory ceiling
 // before a single chunk could be read at all. Running out of memory *after*
 // reading at least one chunk is treated as a normal stopping point, not a
 // failure: whatever was read is still good data, worth uploading and
 // resuming from rather than discarding and starting over.
 static int readDataFileToChunksOnce(UploadChunk *chunks, int maxChunks, size_t startOffset, size_t *outBytesRead, bool *outReachedEOF) {
-    File fileToStream = SD.open(DATA_FILE_PATH, FILE_READ);
+    File fileToStream = LittleFS.open(DATA_FILE_PATH, FILE_READ);
     if (!fileToStream) {
         DebugLog.println("[Uploader] Failed to open data file for reading.");
         return -1;
@@ -1026,32 +1043,18 @@ static int readDataFileToChunksOnce(UploadChunk *chunks, int maxChunks, size_t s
 }
 
 // Reads (a batch of, starting at startOffset) the data file into RAM chunks.
-// Meant to be called while WiFi is off — the only time SD access on this
-// hardware is guaranteed not to collide with active radio transmission — so
-// the later upload step needs no more SD access at all, regardless of how
-// busy WiFi gets while connecting/sending. Returns the chunk count (>= 0) on
-// success, or -1 on failure.
+// The whole batch is read up front so the later upload step is pure network
+// I/O. Returns the chunk count (>= 0) on success, or -1 on failure.
 //
-// SD is already mounted from setup() and hasn't been touched by WiFi since
-// (the radio's been off this whole idle period), so the first attempt just
-// reads directly rather than reinitializing SD first — repeated SD.end()/
-// SD.begin() cycles were observed to leak a large amount of heap (~130KB in
-// one case) on this SD library, and the "radio might have crashed it"
-// justification for reiniting preemptively no longer applies now that SD
-// access never overlaps with WiFi. The reinit is kept as an actual recovery
-// step for retries, since the SD bus can still glitch mid-read on its own.
+// Retries are mostly for the out-of-memory case (heap may have freed up a
+// little after a short pause); internal flash reads don't glitch the way the
+// old SD bus did, so no remount is needed between attempts.
 static int readDataFileToChunks(UploadChunk *chunks, int maxChunks, size_t startOffset, size_t *outBytesRead, bool *outReachedEOF) {
     const int MAX_READ_ATTEMPTS = 3;
     for (int attempt = 1; attempt <= MAX_READ_ATTEMPTS; ++attempt) {
         if (attempt > 1) {
-            DebugLog.printf("[Uploader] Retrying SD read (attempt %d/%d)...\n", attempt, MAX_READ_ATTEMPTS);
-            SD.end();
+            DebugLog.printf("[Uploader] Retrying data file read (attempt %d/%d)...\n", attempt, MAX_READ_ATTEMPTS);
             delay(200);
-            if (!SD.begin(SD_CS_PIN, sdSpi)) {
-                DebugLog.println("[Uploader] SD reinit failed during retry.");
-                continue;
-            }
-            openDebugLogFile(); // reinit above invalidated the debug file handle too
         }
 
         int chunkCount = readDataFileToChunksOnce(chunks, maxChunks, startOffset, outBytesRead, outReachedEOF);
@@ -1062,13 +1065,13 @@ static int readDataFileToChunks(UploadChunk *chunks, int maxChunks, size_t start
         }
     }
 
-    DebugLog.println("[Uploader] Giving up after repeated SD read failures.");
+    DebugLog.println("[Uploader] Giving up after repeated data file read failures.");
     return -1;
 }
 
 // POSTs one chunk; the backend appends it to the persistent Drive file
 // (isFirstChunk tells it whether to strip a leading header line, since only
-// the first chunk of a batch can contain one). No SD access — call only once
+// the first chunk of a batch can contain one). No file access — call only once
 // WiFi is connected.
 static bool uploadOneChunk(uint8_t *buffer, size_t size, bool isFirstChunk) {
     DebugLog.printf("[Uploader] Uploading chunk (%d bytes, first=%s)...\n", (int)size, isFirstChunk ? "true" : "false");
@@ -1183,7 +1186,7 @@ void loop() {
 
 			DebugLog.println("\n[Idle Sensor] Vehicle stationary for 15s.");
 
-			if (!SD.exists(DATA_FILE_PATH)) {
+			if (!LittleFS.exists(DATA_FILE_PATH)) {
 				DebugLog.println("[Idle Sensor] No data file this session; nothing to upload.");
 			} else {
 				DebugLog.println("[Idle Sensor] Booting up Wi-Fi Radio Hardware...");
@@ -1226,7 +1229,7 @@ void loop() {
 					while (keepGoing && batchNum < MAX_BATCHES_PER_SESSION) {
 						batchNum++;
 
-						// Radio off for the SD read — already off from the scan
+						// Radio off for the file read — already off from the scan
 						// above on the first batch; a prior batch's upload left
 						// it on, so later batches need to power it down again.
 						WiFi.disconnect(true);
@@ -1248,7 +1251,7 @@ void loop() {
 							// Nothing left to read — already fully synced (e.g. a
 							// prior session finished but cleanup didn't run).
 							if (pendingReachedEOF) {
-								SD.remove(DATA_FILE_PATH);
+								LittleFS.remove(DATA_FILE_PATH);
 								clearSyncOffset();
 								DebugLog.println("[Idle Sensor] Data file was already fully synced; cleared.");
 							}
@@ -1295,7 +1298,7 @@ void loop() {
 
 						size_t newOffset = syncStartOffset + pendingBytesRead;
 						if (pendingReachedEOF) {
-							SD.remove(DATA_FILE_PATH); // fully synced — next row logged starts a fresh file
+							LittleFS.remove(DATA_FILE_PATH); // fully synced — next row logged starts a fresh file
 							clearSyncOffset();
 							DebugLog.println("[Idle Sensor] Data file fully synced and cleared.");
 							keepGoing = false;

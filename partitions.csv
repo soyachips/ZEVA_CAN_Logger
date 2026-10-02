@@ -1,0 +1,11 @@
+# ESP32-S3-WROOM-1-N16R8 (16MB flash).
+# Two 2MB OTA app slots (firmware is ~1MB) and the rest for LittleFS log storage.
+# The data partition keeps the "spiffs" name/subtype because that's what
+# LittleFS.begin() looks for by default.
+# Name,   Type, SubType, Offset,   Size,
+nvs,      data, nvs,     0x9000,   0x5000,
+otadata,  data, ota,     0xe000,   0x2000,
+app0,     app,  ota_0,   0x10000,  0x200000,
+app1,     app,  ota_1,   0x210000, 0x200000,
+spiffs,   data, spiffs,  0x410000, 0xBE0000,
+coredump, data, coredump,0xFF0000, 0x10000,
