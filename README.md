@@ -1,6 +1,6 @@
 # ZEVA ESP32 Cell Voltage Logger
 
-An ESP32-S3-based logger for ZEVA BMS CAN data. It listens for ZEVA BMS packets on CAN, logs pack/cell voltages as CSV to the module's internal flash, serves a live web dashboard when in range of a WiFi hotspot, and automatically uploads whatever hasn't been synced yet to Google Drive once it detects it's parked at home.
+An ESP32-S3-based logger for ZEVA BMS CAN data. It listens for ZEVA BMS packets on CAN, logs pack/cell voltages as CSV to the module's internal flash, hosts its own WiFi access point with a live web dashboard, and automatically uploads whatever hasn't been synced yet to Google Drive once it detects it's parked at home.
 
 ## Current behavior
 - uses ESP32 TWAI (native CAN) on pins `TX=IO12`, `RX=IO14` at 250 kbps
@@ -9,7 +9,7 @@ An ESP32-S3-based logger for ZEVA BMS CAN data. It listens for ZEVA BMS packets 
 - logs to a single file (`/data.csv`) on a LittleFS partition in internal flash, only while the clock has been NTP-synced this boot and pack current is non-zero (charging or discharging) — idle rows and rows from unsynced sessions are still printed to Serial but not written to flash
 - if flash storage fills up (about 11.8 MB usable), logging pauses until the next home sync clears the file — see [Flash storage](#flash-storage)
 - the local file is deleted only once its contents are *fully* synced to Drive, so the next row logged starts a fresh file — a backlog too big to sync in one pass instead makes incremental progress via a persistent byte offset — see [Idle-triggered Drive sync](#idle-triggered-drive-sync)
-- serves a live WiFi dashboard (voltage/current + per-cell trend charts) when connected to a hotspot, plus firmware OTA updates at `/update` via ElegantOTA — see [Flashing firmware over WiFi (OTA)](#flashing-firmware-over-wifi-ota)
+- hosts a WiFi access point (`ZEVA CAN`, device at `10.1.1.1`) serving a live dashboard (voltage/current + per-cell trend charts), plus firmware OTA updates at `/update` via ElegantOTA — see [Flashing firmware over WiFi (OTA)](#flashing-firmware-over-wifi-ota)
 - automatically detects when the vehicle has been idle (current within a small deadband of 0 A) for 15 seconds, and if a known home WiFi network is in range, syncs the entire not-yet-synced backlog to a persistent file on Google Drive — one bounded batch at a time (read into RAM with WiFi off, then WiFi on to upload), looping through batches until fully caught up rather than syncing only a capped amount per visit — see [Idle-triggered Drive sync](#idle-triggered-drive-sync)
 - can optionally mirror boot/connectivity/upload events (not raw telemetry) to a single evergreen `/log.txt` debug file in flash with per-line timestamps, so a run can be diagnosed without a serial monitor attached — off by default, see [Debug/event log](#debugevent-log-logtxt)
 
@@ -37,11 +37,14 @@ Changing `partitions.csv` moves the data partition, so flash the board over seri
 
 ## Setup
 1. Copy `include/secrets.h.example` to `include/secrets.h` and fill in your real values (this file is gitignored and never committed):
-   - `SECRET_HOTSPOT_SSID` / `SECRET_HOTSPOT_PASSWORD` — the network used for the live dashboard (e.g. a phone hotspot)
+   - `SECRET_AP_PASSWORD` — WPA2 password (8-63 characters) for the logger's own `ZEVA CAN` access point. Anyone who joins the AP can flash firmware at `/update`, so don't leave it weak
    - `SECRET_HOME_SSID` / `SECRET_HOME_PASSWORD` — your home WiFi, used for NTP sync and automatic data upload
    - `SECRET_UPLOAD_SCRIPT_PATH` — the path portion of your Google Apps Script Web App deployment URL (everything after `script.google.com`)
 2. Build and flash with PlatformIO (`pio run --target upload`). This board's auto-reset circuit isn't reliable — if you see `Wrong boot mode detected`, hold **BOOT**, tap **EN/RESET** once, keep holding BOOT until the upload starts connecting, then release.
-3. Set `local_IP` / `gateway` / `subnet` / `primaryDNS` in `src/main.cpp` to match your hotspot's subnet if it's not an iPhone-style `172.20.10.x` hotspot.
+
+The dashboard's charting library (Chart.js) is built into the firmware and served from `/chart.js`, because the access point has no internet. It's stored gzipped in `include/chartjs_gz.h`; to change the Chart.js version, run `python tools/embed_chartjs.py <version>` and rebuild.
+
+The access point's SSID and addressing (`AP_SSID`, `apIP`, `apSubnet`) are set near the top of `src/main.cpp`: SSID `ZEVA CAN`, subnet `10.1.1.0/24`, device at `10.1.1.1`, clients get addresses from `10.1.1.2` up by DHCP.
 
 ### Google Apps Script upload endpoint
 The firmware POSTs each chunk's raw CSV body to `https://script.google.com{SECRET_UPLOAD_SCRIPT_PATH}?filename=data.csv&first=<true|false>` with `Content-Type: text/csv`. The handler in [`google-apps-script/Code.gs`](google-apps-script/Code.gs):
@@ -60,21 +63,21 @@ Note: the Drive file just keeps growing across every successful sync (there's no
 
 ## Boot sequence
 1. Try connecting to home WiFi (≤10s). If found, sync the clock via NTP, then disconnect.
-2. Try connecting to the dashboard hotspot (≤10s). If found: apply the static IP, sync NTP as a fallback if step 1 didn't already succeed, and start the web dashboard + OTA server. If not found: switch to offline logging mode.
-3. Initialize CAN either way (flash storage is mounted at the very start of boot). If the clock was synced (from either network), open (or resume appending to) `/data.csv`. A brand-new file gets a placeholder-width header (`cell1..cell192`, covering the maximum possible module/cell configuration) so the file exists immediately — useful for bench testing without a live CAN bus — and that header is rewritten to the real cell count the moment the first actual CAN row is logged (see CSV data file format).
+2. Start the `ZEVA CAN` access point at `10.1.1.1` and the web dashboard + OTA server. The AP stays up from then on, except while an idle sync has the radio connected to home WiFi; it comes back as soon as the sync finishes.
+3. Initialize CAN (flash storage is mounted at the very start of boot). If the clock was synced in step 1, open (or resume appending to) `/data.csv`. A brand-new file gets a placeholder-width header (`cell1..cell192`, covering the maximum possible module/cell configuration) so the file exists immediately — useful for bench testing without a live CAN bus — and that header is rewritten to the real cell count the moment the first actual CAN row is logged (see CSV data file format).
 
-If neither network is in range, the ESP32's clock is never set for that boot session, and logging is skipped entirely — CAN data still prints to Serial for live viewing, but nothing is written to flash, since row timestamps are wall-clock based and would be meaningless without a synced clock. This also means a session with no clock sync has no data file to upload later, so the idle-triggered Drive sync becomes a no-op for that boot.
+If home WiFi isn't in range at boot, the ESP32's clock is never set for that boot session (the access point has no internet, so it can't provide NTP), and logging is skipped entirely — CAN data still prints to Serial for live viewing, but nothing is written to flash, since row timestamps are wall-clock based and would be meaningless without a synced clock. This also means a session with no clock sync has no data file to upload later, so the idle-triggered Drive sync becomes a no-op for that boot.
 
 ## Flashing firmware over WiFi (OTA)
-No USB cable needed once the board is on the hotspot. PlatformIO doesn't push anything anywhere by itself — it only builds the `.bin` file; you upload that file manually through ElegantOTA's web page.
+No USB cable needed. PlatformIO doesn't push anything anywhere by itself — it only builds the `.bin` file; you upload that file manually through ElegantOTA's web page.
 
-1. **Get the ESP32 onto the hotspot.** Power it on within range of `SECRET_HOTSPOT_SSID` (see Setup). It only opens the OTA server during its boot-time hotspot connection attempt, so it has to already be connected — if it boots out of range and falls into offline mode, power-cycle it in range to get another shot.
-2. **Connect your computer to that same hotspot.** `/update` is only reachable from a device on the same network.
-3. **Build (don't flash) the new firmware**: `pio run -e esp32s3`. This produces `.pio/build/esp32s3/firmware.bin` on your computer — it does not touch the ESP32.
-4. **Open `http://172.20.10.9/update`** in a browser (adjust the IP if you changed `local_IP` in `src/main.cpp` — see Setup).
+1. **Build (don't flash) the new firmware**: `pio run -e esp32s3`. This produces `.pio/build/esp32s3/firmware.bin` on your computer — it does not touch the ESP32.
+2. **Power on the ESP32** and wait about 10 seconds (it checks for home WiFi first, then starts its access point).
+3. **Join the `ZEVA CAN` WiFi network** from your computer or phone, using `SECRET_AP_PASSWORD`. Your device may warn the network has no internet; stay connected anyway.
+4. **Open `http://10.1.1.1/update`** in a browser.
 5. Choose `firmware.bin` on that page and upload it. The board flashes and reboots into the new firmware automatically.
 
-**From a phone instead of a laptop**: upload `firmware.bin` to Google Drive from your computer, then on your phone download it from the Drive app to local storage (not just preview it — the browser's upload picker needs an actual file, e.g. in the Files app / Downloads). With the phone providing the hotspot (and the ESP32 already connected to it), open `http://172.20.10.9/update` in the phone's browser and upload the downloaded file the same way.
+**From a phone instead of a laptop**: upload `firmware.bin` to Google Drive from your computer, then on your phone download it from the Drive app to local storage (not just preview it — the browser's upload picker needs an actual file, e.g. in the Files app / Downloads). Do this *before* joining `ZEVA CAN`, since that network has no internet. Then join it, open `http://10.1.1.1/update` and upload the file the same way.
 
 ## Idle-triggered Drive sync
 Once pack current has read within `CURRENT_IDLE_THRESHOLD_MA` of zero (a deadband, not an exact-zero check — current sensors have noise/offset and rarely read exactly 0 at rest) for 15 straight seconds, and the home WiFi network is actually in range, the logger loops through batches until the whole backlog is drained (or something stops progress):
@@ -118,7 +121,7 @@ A single evergreen text file in flash storage that mirrors boot, WiFi/NTP, and u
 
 ## Known limitations
 - The Google Drive upload connection doesn't validate the server's TLS certificate (`setInsecure()`), so it's not protected against a MITM on that connection.
-- The live dashboard loads Chart.js from a public CDN, so it won't render charts if your hotspot has no real internet backhaul (only local link to the ESP32).
+- The access point is always on (apart from idle syncs), which adds roughly 100 mA of draw compared with the radio being off.
 - Flash storage is limited to about 11.8 MB. If the vehicle runs for long stretches without a home sync, logging pauses once storage is full and those rows are lost (see [Flash storage](#flash-storage)).
 - **WiFi needs a meaningful amount of free heap to initialize, and it competes directly with the idle sync's chunked read for that same memory.** This was the root cause behind a long chain of "impossible" allocation failures during development, where the reported largest free block was repeatedly bigger than the request that had just failed — reading as much of the backlog as would fit in RAM (196KB in one case) left too little heap for `WiFi.mode(WIFI_STA)` to spawn its own task afterward (`wifi:create wifi task: failed to create task`), which is a distinct failure from anything actually wrong with the read itself. `MAX_BATCH_BYTES` (see Idle-triggered Drive sync) now caps how much a sync ever holds in RAM specifically to leave WiFi enough room, regardless of how much more the heap could technically provide in the moment.
 - A batch spanning more than one chunk can duplicate rows on Drive if WiFi drops partway through uploading it — see the duplicate-row caveat in Idle-triggered Drive sync. Bounded to at most one batch's worth of data since the offset mechanism was added, rather than a whole unsynced backlog.

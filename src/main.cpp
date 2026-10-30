@@ -8,12 +8,10 @@
 #include <ElegantOTA.h>
 
 #include "secrets.h"
+#include "chartjs_gz.h"
 
 // --- NETWORK CREDENTIAL MANAGEMENT ---
 // Real values live in include/secrets.h (gitignored) — see include/secrets.h.example
-const char* ssid = SECRET_HOTSPOT_SSID;
-const char* password = SECRET_HOTSPOT_PASSWORD;
-
 const char* home_ssid = SECRET_HOME_SSID;
 const char* home_password = SECRET_HOME_PASSWORD;
 
@@ -39,8 +37,8 @@ const char index_html[] PROGMEM = R"rawliteral(
 <head>
     <meta name="viewport" content="width=device-width, initial-scale=1">
     <title>ZEVA BMS Cell Monitor</title>
-    <!-- Spaced word path bypasses auto-formatter truncation layout errors -->
-    <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
+    <!-- Served by the logger itself: the access point has no internet -->
+    <script src="/chart.js"></script>
     <style>
         body { font-family: Arial, sans-serif; background: #121212; color: #e0e0e0; padding: 10px; margin: 0; text-align: center; }
         h1 { color: #cccccc; font-size: 22px; margin: 10px 0 5px 0; }
@@ -237,13 +235,30 @@ const char index_html[] PROGMEM = R"rawliteral(
 )rawliteral";
 
 
-IPAddress local_IP(172, 20, 10, 9);    // The specific IP you want (172.20.10.3)
-IPAddress gateway(172, 20, 10, 1);     // Your phone's hotspot controller address
-IPAddress subnet(255, 255, 255, 0);   // Standard hotspot network mask
-IPAddress primaryDNS(172, 20, 10, 1);  // Use your phone for DNS requests
+// --- ACCESS POINT (dashboard / OTA) ---
+// The logger hosts its own WiFi network; clients get 10.1.1.x by DHCP.
+static const char *AP_SSID = "ZEVA CAN";
+static const char *AP_PASSWORD = SECRET_AP_PASSWORD;
+IPAddress apIP(10, 1, 1, 1);
+IPAddress apSubnet(255, 255, 255, 0);
 
 // Global definition of your web server
 WebServer server(80);
+
+// Brings up (or restores) the access point. Safe to call when it's already
+// running. The idle sync switches the radio to station mode to reach home
+// WiFi, which drops the AP, so the sync calls this again when it's done.
+static void startAccessPoint() {
+	if (WiFi.getMode() == WIFI_AP) return;
+	WiFi.disconnect(true);
+	WiFi.mode(WIFI_AP);
+	WiFi.softAPConfig(apIP, apIP, apSubnet);
+	if (WiFi.softAP(AP_SSID, AP_PASSWORD)) {
+		Serial.printf("Access point \"%s\" up at %s\n", AP_SSID, WiFi.softAPIP().toString().c_str());
+	} else {
+		Serial.println("Failed to start access point.");
+	}
+}
 
 static const gpio_num_t CAN_TX_PIN = GPIO_NUM_12;
 static const gpio_num_t CAN_RX_PIN = GPIO_NUM_14;
@@ -700,80 +715,46 @@ void setup() {
 		DebugLog.println("\nHome Wi-Fi not found at boot.");
 	}
 
-	// 1. Set wireless station properties
-	WiFi.begin(ssid, password);
-	DebugLog.print("Searching for Hotspot (10s timeout)");
+	// 1. Host our own access point for the dashboard and OTA updates. It stays
+	// up from here on, except while an idle sync has the radio on home WiFi.
+	startAccessPoint();
 
-	int attemptCounter = 0;
-	bool wifiConnected = true;
+	// 2. Mount local system web routes
+	server.on("/", HTTP_GET, [](){
+		server.send_P(200, "text/html", index_html);
+	});
 
-	// Loop 20 times with a 500ms delay = 10 seconds total tracking window
-	while (WiFi.status() != WL_CONNECTED) {
-		delay(500);
-		DebugLog.print(".");
-		attemptCounter++;
+	// Chart.js for the dashboard, stored gzipped (see tools/embed_chartjs.py)
+	server.on("/chart.js", HTTP_GET, [](){
+		server.sendHeader("Content-Encoding", "gzip");
+		server.sendHeader("Cache-Control", "max-age=86400");
+		server.send_P(200, "application/javascript", (const char *)CHARTJS_GZ, CHARTJS_GZ_LEN);
+	});
 
-		if (attemptCounter >= 20) {
-			wifiConnected = false;
-			break;
-		}
-	}
+	server.on("/data", HTTP_GET, [](){
+		String json = "{";
+		json += "\"voltage\":" + String(packVoltage) + ",";
+		json += "\"current\":" + String(packCurrent) + ",";
+		json += "\"cells\":[";
 
-	// BRANCH A: ONLINE MODE (Hotspot Found!)
-	if (wifiConnected) {
-		DebugLog.println("\nConnected successfully!!! Network node established.");
-		delay(WIFI_SETTLE_DELAY_MS); // let association/DHCP traffic settle
-		DebugLog.print("IP Address: ");
-		DebugLog.println(WiFi.localIP());
-
-		// 2. Request chosen static IP configuration allocation
-		if (!WiFi.config(local_IP, gateway, subnet, primaryDNS)) {
-			DebugLog.println("Static IP configuration failed to apply!");
-		}
-
-		// 3. Fall back to NTP here too, in case home Wi-Fi wasn't in range
-		// (or had no internet) at boot.
-		if (!timeSynced) {
-			timeSynced = syncTimeFromNTP();
-		}
-
-		// 4. Mount local system web routes
-		server.on("/", HTTP_GET, [](){
-			server.send_P(200, "text/html", index_html);
-		});
-
-		server.on("/data", HTTP_GET, [](){
-			String json = "{";
-			json += "\"voltage\":" + String(packVoltage) + ",";
-			json += "\"current\":" + String(packCurrent) + ",";
-			json += "\"cells\":[";
-
-			bool firstCell = true;
-			for (int m = 0; m < MAX_BMS_MODULES; m++) {
-				uint8_t cellsInThisModule = getModuleCellCount(m);
-				for (int c = 0; c < cellsInThisModule; c++) {
-					if (!firstCell) json += ",";
-					json += String(bmsModules[m].volts[c]);
-					firstCell = false;
-				}
+		bool firstCell = true;
+		for (int m = 0; m < MAX_BMS_MODULES; m++) {
+			uint8_t cellsInThisModule = getModuleCellCount(m);
+			for (int c = 0; c < cellsInThisModule; c++) {
+				if (!firstCell) json += ",";
+				json += String(bmsModules[m].volts[c]);
+				firstCell = false;
 			}
-			json += "]}";
-			server.send(200, "application/json", json);
-		});
+		}
+		json += "]}";
+		server.send(200, "application/json", json);
+	});
 
-		// 5. Initialize the WebOTA Dashboard Interface and Start Server
-		ElegantOTA.begin(&server);
-		server.begin();
-		DebugLog.println("Web Server initialized.");
+	// 3. Initialize the WebOTA Dashboard Interface and Start Server
+	ElegantOTA.begin(&server);
+	server.begin();
+	DebugLog.println("Web Server initialized.");
 
-	// BRANCH B: OFFLINE MODE (Hotspot Missing)
-	} else {
-		DebugLog.println("\nHotspot not found. Switching to Offline Logger Mode.");
-		WiFi.disconnect(true);
-		WiFi.mode(WIFI_OFF); // Power off antenna arrays completely
-	}
-
-	// BOTH BRANCHES CONTINUOUSLY RUN INDEPENDENT HARDWARE CONFIGURATIONS BELOW HERE
 	DebugLog.println("ZEVA ESP32 CAN cell voltage logger");
 	DebugLog.println("Waiting for CAN data...");
 
@@ -1171,6 +1152,10 @@ void loop() {
 		}
 	}
 
+	// Serve dashboard / OTA requests from access point clients
+	server.handleClient();
+	ElegantOTA.loop();
+
 	// 2. THE IDLE PROXIMITY ENGINE (Monitors home location arrival states)
 	if (isPackIdle()) {
 		if (!trackingZeroCurrent) {
@@ -1310,8 +1295,7 @@ void loop() {
 					}
 				}
 
-				WiFi.disconnect(true);
-				WiFi.mode(WIFI_OFF);
+				startAccessPoint(); // sync is done with home WiFi; bring the AP back
 			}
 		}
 	} else {
@@ -1321,8 +1305,7 @@ void loop() {
 		}
 		trackingZeroCurrent = false;
 		if (hasScannedThisIdleSession) {
-			WiFi.disconnect(true);
-			WiFi.mode(WIFI_OFF);
+			startAccessPoint(); // no-op unless a sync left the radio off the AP
 			hasScannedThisIdleSession = false;
 		}
 	}
